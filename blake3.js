@@ -158,6 +158,98 @@
     return bytes;
   }
 
+  // Pre-allocated CV arrays for SIMD output
+  const simdCvs = [new Uint32Array(8), new Uint32Array(8), new Uint32Array(8), new Uint32Array(8)];
+
+  // Process 4 complete chunks in parallel using SIMD
+  // Returns array of 4 CVs (each Uint32Array of 8 words)
+  function processChunks4xSimd(input, inputOffset, baseChunkCounter) {
+    // Memory layout for compress4x:
+    // Offset 0-127 (words 0-31): Input CV - 8 v128s, each word interleaved across 4 chunks
+    // Offset 256-511 (words 64-127): Message - 16 v128s, each word interleaved
+    // Offset 768-831 (words 192-207): counter_lo, counter_hi, block_len, flags (each v128)
+    // Offset 1024-1151 (words 256-287): Output CV
+
+    // Initialize all 4 CVs to IV (unrolled for speed)
+    const iv0 = IV[0], iv1 = IV[1], iv2 = IV[2], iv3 = IV[3];
+    const iv4 = IV[4], iv5 = IV[5], iv6 = IV[6], iv7 = IV[7];
+    wasmMem32[0] = iv0; wasmMem32[1] = iv0; wasmMem32[2] = iv0; wasmMem32[3] = iv0;
+    wasmMem32[4] = iv1; wasmMem32[5] = iv1; wasmMem32[6] = iv1; wasmMem32[7] = iv1;
+    wasmMem32[8] = iv2; wasmMem32[9] = iv2; wasmMem32[10] = iv2; wasmMem32[11] = iv2;
+    wasmMem32[12] = iv3; wasmMem32[13] = iv3; wasmMem32[14] = iv3; wasmMem32[15] = iv3;
+    wasmMem32[16] = iv4; wasmMem32[17] = iv4; wasmMem32[18] = iv4; wasmMem32[19] = iv4;
+    wasmMem32[20] = iv5; wasmMem32[21] = iv5; wasmMem32[22] = iv5; wasmMem32[23] = iv5;
+    wasmMem32[24] = iv6; wasmMem32[25] = iv6; wasmMem32[26] = iv6; wasmMem32[27] = iv6;
+    wasmMem32[28] = iv7; wasmMem32[29] = iv7; wasmMem32[30] = iv7; wasmMem32[31] = iv7;
+
+    // Create typed array views if input is aligned
+    const inputAligned = (input.byteOffset + inputOffset) % 4 === 0;
+    let inputView = null;
+    if (inputAligned) {
+      inputView = new Uint32Array(input.buffer, input.byteOffset + inputOffset);
+    }
+
+    // Pre-set static counter values
+    wasmMem32[192] = baseChunkCounter;
+    wasmMem32[193] = baseChunkCounter + 1;
+    wasmMem32[194] = baseChunkCounter + 2;
+    wasmMem32[195] = baseChunkCounter + 3;
+    wasmMem32[196] = 0; wasmMem32[197] = 0; wasmMem32[198] = 0; wasmMem32[199] = 0;  // counter_hi
+    wasmMem32[200] = BLOCK_LEN; wasmMem32[201] = BLOCK_LEN; wasmMem32[202] = BLOCK_LEN; wasmMem32[203] = BLOCK_LEN;
+
+    // Process all 16 blocks
+    for (let block = 0; block < 16; block++) {
+      // Set flags
+      const flags = (block === 0 ? CHUNK_START : 0) | (block === 15 ? CHUNK_END : 0);
+      wasmMem32[204] = flags; wasmMem32[205] = flags; wasmMem32[206] = flags; wasmMem32[207] = flags;
+
+      // Set up message words (interleaved across 4 chunks)
+      const blockOff = block * 16;  // 16 words per block
+      if (inputView) {
+        // Fast path: aligned input, use Uint32Array
+        const c0 = 0, c1 = 256, c2 = 512, c3 = 768;  // chunk offsets in words
+        for (let w = 0; w < 16; w++) {
+          const dst = 64 + w * 4;
+          wasmMem32[dst] = inputView[c0 + blockOff + w];
+          wasmMem32[dst + 1] = inputView[c1 + blockOff + w];
+          wasmMem32[dst + 2] = inputView[c2 + blockOff + w];
+          wasmMem32[dst + 3] = inputView[c3 + blockOff + w];
+        }
+      } else {
+        // Slow path: unaligned input
+        for (let w = 0; w < 16; w++) {
+          const dst = 64 + w * 4;
+          for (let c = 0; c < 4; c++) {
+            const byteOff = c * CHUNK_LEN + block * BLOCK_LEN + w * 4;
+            wasmMem32[dst + c] =
+              input[inputOffset + byteOff] |
+              (input[inputOffset + byteOff + 1] << 8) |
+              (input[inputOffset + byteOff + 2] << 16) |
+              (input[inputOffset + byteOff + 3] << 24);
+          }
+        }
+      }
+
+      // Call compress4x
+      wasmCompress4x();
+
+      // Copy output CVs back to input for next block
+      for (let i = 0; i < 32; i++) {
+        wasmMem32[i] = wasmMem32[256 + i];
+      }
+    }
+
+    // Extract 4 CVs from output (de-interleave into pre-allocated arrays)
+    for (let w = 0; w < 8; w++) {
+      const src = 256 + w * 4;
+      simdCvs[0][w] = wasmMem32[src];
+      simdCvs[1][w] = wasmMem32[src + 1];
+      simdCvs[2][w] = wasmMem32[src + 2];
+      simdCvs[3][w] = wasmMem32[src + 3];
+    }
+    return simdCvs;
+  }
+
   function hash(input, outputLen) {
     if (typeof input === 'string') {
       input = new TextEncoder().encode(input);
@@ -190,6 +282,33 @@
     let offset = 0;
     let chunkCounter = 0;
 
+    // SIMD path: process 4 full chunks at a time
+    // Uses WASM SIMD to process 4 independent chunks in parallel
+    if (wasmSimdEnabled && totalLen >= 4 * CHUNK_LEN) {
+      while (offset + 4 * CHUNK_LEN <= totalLen) {
+        // Process 4 chunks with SIMD
+        const cvs = processChunks4xSimd(input, offset, chunkCounter);
+
+        // Add all 4 CVs to stack and merge
+        for (let i = 0; i < 4; i++) {
+          stack.set(cvs[i], stackPos);
+          stackPos += 8;
+          chunkCounter++;
+
+          // Merge pairs in Merkle tree
+          let tc = chunkCounter;
+          while ((tc & 1) === 0 && stackPos > 8) {
+            stackPos -= 16;
+            compress(IV, 0, stack, stackPos, stack, stackPos, true, 0, BLOCK_LEN, flags | PARENT);
+            stackPos += 8;
+            tc >>= 1;
+          }
+        }
+        offset += 4 * CHUNK_LEN;
+      }
+    }
+
+    // Scalar path for remaining chunks
     while (offset < totalLen) {
       const chunkStart = offset;
       const chunkEnd = Math.min(offset + CHUNK_LEN, totalLen);
