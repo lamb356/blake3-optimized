@@ -26,13 +26,13 @@
   ;; rotr12 and rotr7 use shift operations
   (func $rotr12 (param $x v128) (result v128)
     (v128.or
-      (i32x4.shr_u (local.get $x) (i32x4.splat (i32.const 12)))
-      (i32x4.shl (local.get $x) (i32x4.splat (i32.const 20)))))
+      (i32x4.shr_u (local.get $x) (i32.const 12))
+      (i32x4.shl (local.get $x) (i32.const 20))))
 
   (func $rotr7 (param $x v128) (result v128)
     (v128.or
-      (i32x4.shr_u (local.get $x) (i32x4.splat (i32.const 7)))
-      (i32x4.shl (local.get $x) (i32x4.splat (i32.const 25)))))
+      (i32x4.shr_u (local.get $x) (i32.const 7))
+      (i32x4.shl (local.get $x) (i32.const 25))))
 
   ;; Main compress4x function
   ;; Processes 4 independent chunks using SIMD
