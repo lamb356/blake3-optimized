@@ -264,7 +264,8 @@
 
     // SIMD path: process 4 full chunks at a time
     // Uses WASM SIMD to process 4 independent chunks in parallel
-    if (wasmSimdEnabled && totalLen >= 4 * CHUNK_LEN) {
+    // DISABLED: WASM module has bugs producing wrong CVs
+    if (false && wasmSimdEnabled && totalLen >= 4 * CHUNK_LEN) {
       while (offset + 4 * CHUNK_LEN <= totalLen) {
         // Process 4 chunks with SIMD
         const cvs = processChunks4xSimd(input, offset, chunkCounter);
@@ -275,9 +276,14 @@
           stackPos += 8;
           chunkCounter++;
 
-          // Merge pairs in Merkle tree
+          // Check if this is the last chunk of input
+          const isLastChunk = (offset + 4 * CHUNK_LEN >= totalLen) && (i === 3);
+
+          // Merge pairs in Merkle tree, but stop before final merge if this is the last chunk
           let tc = chunkCounter;
           while ((tc & 1) === 0 && stackPos > 8) {
+            // Don't do the final merge here - leave it for finalization with ROOT flag
+            if (isLastChunk && stackPos === 16) break;
             stackPos -= 16;
             compress(IV, 0, stack, stackPos, stack, stackPos, true, 0, BLOCK_LEN, flags | PARENT);
             stackPos += 8;
@@ -341,6 +347,7 @@
     if (chunkCounter === 1) {
       out.set(new Uint32Array(stack.buffer, 0, 8));
     } else {
+      // Final merges with ROOT flag on the last one
       while (stackPos > 8) {
         stackPos -= 16;
         const isRoot = stackPos === 0;
