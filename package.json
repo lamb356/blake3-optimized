@@ -1,0 +1,24 @@
+{
+  "name": "blake3-bounty",
+  "version": "1.0.0",
+  "description": "A highly optimized pure JavaScript implementation of the [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) cryptographic hash function with embedded WASM SIMD support for maximum performance.",
+  "main": "benchmark.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lamb356/blake3-optimized.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/lamb356/blake3-optimized/issues"
+  },
+  "homepage": "https://github.com/lamb356/blake3-optimized#readme",
+  "dependencies": {
+    "wabt": "^1.0.39"
+  }
+}
