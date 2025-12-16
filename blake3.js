@@ -242,6 +242,14 @@
     }
 
     outputLen = outputLen || 32;
+
+    // For extended output (XOF), use the Hasher class which supports it
+    if (outputLen > 32) {
+      const hasher = new Hasher();
+      hasher.update(input);
+      return hasher.finalize(outputLen);
+    }
+
     const out = new Uint32Array(8);
     const totalLen = input.length;
     const flags = 0;
@@ -485,50 +493,101 @@
     }
 
     finalize(outputLen = 32) {
-      const out = new Uint32Array(8);
+      // Determine the root output node: CV, block, blockLen, flags
+      let rootCv, rootBlock, rootBlockLen, rootFlags;
       const hasData = this.chunkCounter > 0 || this.chunkLen > 0;
 
       if (!hasData) {
-        blockWords.fill(0);
-        compress(this.keyWords, 0, blockWords, 0, out, 0, true, 0, 0, this.baseFlags | CHUNK_START | CHUNK_END | ROOT);
-        return wordsToBytes(out).slice(0, outputLen);
-      }
-
-      const isOnlyChunk = this.chunkCounter === 0;
-      const isRoot = isOnlyChunk && this.cvStack.length === 0;
-
-      this._compressBlock(true, isRoot);
-
-      if (isOnlyChunk) {
-        out.set(this.cv);
+        // Empty input case
+        rootCv = this.keyWords;
+        rootBlock = new Uint32Array(16); // zeros
+        rootBlockLen = 0;
+        rootFlags = this.baseFlags | CHUNK_START | CHUNK_END | ROOT;
       } else {
-        this.cvStack.push(new Uint32Array(this.cv));
+        const isOnlyChunk = this.chunkCounter === 0;
 
-        while (this.cvStack.length > 1) {
-          const right = this.cvStack.pop();
-          const left = this.cvStack.pop();
-          const isRootMerge = this.cvStack.length === 0;
+        if (isOnlyChunk) {
+          // Single chunk - the root node is this chunk's final block
+          // First, compress all complete blocks (without ROOT flag)
+          // Then use the final partial block as the root node
 
-          const parentBlock = new Uint32Array(16);
-          parentBlock.set(left, 0);
-          parentBlock.set(right, 8);
+          // Convert block buffer to words (same way as _compressBlock)
+          rootBlock = new Uint32Array(16);
+          for (let i = 0; i < this.blockLen; i++) {
+            rootBlock[i >> 2] |= this.blockBuffer[i] << ((i & 3) * 8);
+          }
 
-          const merged = new Uint32Array(8);
-          compress(this.keyWords, 0, parentBlock, 0, merged, 0, true, 0, BLOCK_LEN, this.baseFlags | PARENT | (isRootMerge ? ROOT : 0));
+          rootCv = this.cv; // Current CV (after any previous blocks in this chunk)
+          rootBlockLen = this.blockLen;
+          // CHUNK_START if this is the first block (chunkLen <= blockLen means no prior compressions)
+          rootFlags = this.baseFlags | (this.chunkLen <= BLOCK_LEN ? CHUNK_START : 0) | CHUNK_END | ROOT;
+        } else {
+          // Multiple chunks - need to merge CVs and create parent root node
+          // First, finalize the current chunk
+          this._compressBlock(true, false); // CHUNK_END but not ROOT
+          this.cvStack.push(new Uint32Array(this.cv));
 
-          if (isRootMerge) {
-            out.set(merged);
-          } else {
-            this.cvStack.push(merged);
+          // Merge all CVs
+          while (this.cvStack.length > 1) {
+            const right = this.cvStack.pop();
+            const left = this.cvStack.pop();
+
+            if (this.cvStack.length === 0) {
+              // This is the root merge - don't compress yet, save as root node
+              rootCv = this.keyWords;
+              rootBlock = new Uint32Array(16);
+              rootBlock.set(left, 0);
+              rootBlock.set(right, 8);
+              rootBlockLen = BLOCK_LEN;
+              rootFlags = this.baseFlags | PARENT | ROOT;
+            } else {
+              // Non-root merge
+              const parentBlock = new Uint32Array(16);
+              parentBlock.set(left, 0);
+              parentBlock.set(right, 8);
+
+              const merged = new Uint32Array(8);
+              compress(this.keyWords, 0, parentBlock, 0, merged, 0, true, 0, BLOCK_LEN, this.baseFlags | PARENT);
+              this.cvStack.push(merged);
+            }
+          }
+
+          // Handle case where we have exactly one CV left (shouldn't happen in normal flow)
+          if (this.cvStack.length === 1 && !rootCv) {
+            const onlyCv = this.cvStack[0];
+            rootCv = this.keyWords;
+            rootBlock = new Uint32Array(16);
+            rootBlock.set(onlyCv, 0);
+            rootBlockLen = 32;
+            rootFlags = this.baseFlags | PARENT | ROOT;
           }
         }
-
-        if (this.cvStack.length === 1) {
-          out.set(this.cvStack[0]);
-        }
       }
 
-      return wordsToBytes(out).slice(0, outputLen);
+      // Generate output using XOF mode
+      if (outputLen <= 64) {
+        // Can get all output from a single compression
+        const out = new Uint32Array(16);
+        compress(rootCv, 0, rootBlock, 0, out, 0, false, 0, rootBlockLen, rootFlags);
+        return wordsToBytes(out).slice(0, outputLen);
+      } else {
+        // Need multiple compressions for extended output
+        const result = new Uint8Array(outputLen);
+        let offset = 0;
+        let counter = 0;
+        const out = new Uint32Array(16);
+
+        while (offset < outputLen) {
+          compress(rootCv, 0, rootBlock, 0, out, 0, false, counter, rootBlockLen, rootFlags);
+          const bytes = wordsToBytes(out);
+          const toCopy = Math.min(64, outputLen - offset);
+          result.set(bytes.subarray(0, toCopy), offset);
+          offset += 64;
+          counter++;
+        }
+
+        return result;
+      }
     }
 
     _pushChunkCv() {
