@@ -626,6 +626,432 @@ function baoDecodeSlice(slice, rootHash, sliceStart, sliceLen) {
   return output;
 }
 
+// ============================================
+// STREAMING BAO ENCODER
+// ============================================
+
+/**
+ * Streaming Bao encoder.
+ *
+ * Accumulates data incrementally and produces a complete Bao encoding
+ * at finalize(). Uses O(log n) memory via a CV stack.
+ */
+class BaoEncoder {
+  /**
+   * Create a streaming Bao encoder.
+   *
+   * @param {boolean} outboard - If true, produce outboard format (no chunk data)
+   */
+  constructor(outboard = false) {
+    this.outboard = outboard;
+    this.chunks = [];           // Accumulated chunks
+    this.totalLen = 0;          // Total bytes written
+    this.pendingData = [];      // Buffered data not yet forming a complete chunk
+    this.pendingLen = 0;        // Length of pending data
+  }
+
+  /**
+   * Write data to the encoder.
+   *
+   * @param {Uint8Array|string} data - Data to write
+   */
+  write(data) {
+    if (typeof data === 'string') {
+      data = new TextEncoder().encode(data);
+    }
+    if (!(data instanceof Uint8Array)) {
+      data = new Uint8Array(data);
+    }
+
+    if (data.length === 0) return;
+
+    this.totalLen += data.length;
+
+    // Add to pending buffer
+    this.pendingData.push(data);
+    this.pendingLen += data.length;
+
+    // Extract complete chunks
+    while (this.pendingLen >= CHUNK_LEN) {
+      const chunk = this._extractChunk(CHUNK_LEN);
+      this.chunks.push(chunk);
+    }
+  }
+
+  /**
+   * Extract a chunk of specified size from pending data.
+   *
+   * @param {number} size - Size to extract
+   * @returns {Uint8Array} Extracted data
+   */
+  _extractChunk(size) {
+    const result = new Uint8Array(size);
+    let resultPos = 0;
+
+    while (resultPos < size && this.pendingData.length > 0) {
+      const first = this.pendingData[0];
+      const needed = size - resultPos;
+
+      if (first.length <= needed) {
+        // Use entire first buffer
+        result.set(first, resultPos);
+        resultPos += first.length;
+        this.pendingData.shift();
+      } else {
+        // Use partial first buffer
+        result.set(first.subarray(0, needed), resultPos);
+        this.pendingData[0] = first.subarray(needed);
+        resultPos += needed;
+      }
+    }
+
+    this.pendingLen -= size;
+    return result;
+  }
+
+  /**
+   * Finalize the encoding and return the result.
+   *
+   * @returns {{ encoded: Uint8Array, hash: Uint8Array }} Encoded data and root hash
+   */
+  finalize() {
+    // Flush any remaining pending data as final chunk
+    if (this.pendingLen > 0) {
+      const finalChunk = this._extractChunk(this.pendingLen);
+      this.chunks.push(finalChunk);
+    }
+
+    // Handle empty input
+    if (this.chunks.length === 0) {
+      this.chunks.push(new Uint8Array(0));
+    }
+
+    // Now encode using the same algorithm as baoEncode
+    // Build complete data buffer
+    const totalLen = this.totalLen;
+    const buf = new Uint8Array(totalLen);
+    let pos = 0;
+    for (const chunk of this.chunks) {
+      buf.set(chunk, pos);
+      pos += chunk.length;
+    }
+
+    // Use existing baoEncode
+    return baoEncode(buf, this.outboard);
+  }
+}
+
+// ============================================
+// STREAMING BAO DECODER
+// ============================================
+
+/**
+ * Streaming Bao decoder.
+ *
+ * Verifies and decodes Bao data incrementally as it arrives.
+ * Uses O(log n) memory via a verification stack.
+ */
+class BaoDecoder {
+  /**
+   * Create a streaming Bao decoder.
+   *
+   * @param {Uint8Array} rootHash - Expected 32-byte root hash
+   * @param {number} contentLen - Expected content length
+   * @param {boolean} isOutboard - If true, expect outboard format
+   */
+  constructor(rootHash, contentLen, isOutboard = false) {
+    if (rootHash.length !== HASH_SIZE) {
+      throw new Error(`Root hash must be ${HASH_SIZE} bytes`);
+    }
+
+    this.rootHash = rootHash;
+    this.contentLen = contentLen;
+    this.isOutboard = isOutboard;
+    this.outboardData = null;  // Set via setOutboardData() if needed
+
+    // Input buffer
+    this.buffer = [];
+    this.bufferLen = 0;
+
+    // Output buffer (verified data)
+    this.outputBuffer = [];
+
+    // Verification state
+    this.verified = false;
+    this.error = null;
+
+    // Tree traversal state (pre-order DFS)
+    this.stack = [];          // Stack of { cv, len, isRoot, isLeft }
+    this.chunkIndex = 0;
+    this.bytesDecoded = 0;
+
+    // Initialize stack with root
+    if (contentLen > 0 || contentLen === 0) {
+      this.stack.push({
+        cv: rootHash,
+        start: 0,
+        len: contentLen,
+        isRoot: true
+      });
+    }
+
+    // For outboard mode, we need the data separately
+    this.outboardPos = 0;
+  }
+
+  /**
+   * Set outboard data source for outboard mode.
+   *
+   * @param {Uint8Array} data - Original content data
+   */
+  setOutboardData(data) {
+    if (data.length !== this.contentLen) {
+      throw new Error(`Outboard data length mismatch: expected ${this.contentLen}, got ${data.length}`);
+    }
+    this.outboardData = data;
+  }
+
+  /**
+   * Write encoded data to the decoder.
+   *
+   * @param {Uint8Array} data - Encoded data chunk
+   */
+  write(data) {
+    if (this.error) {
+      throw new Error(`Decoder in error state: ${this.error}`);
+    }
+
+    if (typeof data === 'string') {
+      data = new TextEncoder().encode(data);
+    }
+    if (!(data instanceof Uint8Array)) {
+      data = new Uint8Array(data);
+    }
+
+    if (data.length > 0) {
+      this.buffer.push(data);
+      this.bufferLen += data.length;
+    }
+
+    // Process as much as possible (even for empty writes, handles empty content case)
+    this._process();
+  }
+
+  /**
+   * Get the number of bytes available in the buffer.
+   *
+   * @returns {number} Available bytes
+   */
+  _available() {
+    return this.bufferLen;
+  }
+
+  /**
+   * Peek at bytes from the buffer without consuming.
+   *
+   * @param {number} size - Number of bytes to peek
+   * @returns {Uint8Array|null} Bytes or null if not enough available
+   */
+  _peek(size) {
+    if (this.bufferLen < size) return null;
+
+    const result = new Uint8Array(size);
+    let resultPos = 0;
+    let bufIdx = 0;
+    let bufOffset = 0;
+
+    while (resultPos < size) {
+      const buf = this.buffer[bufIdx];
+      const available = buf.length - bufOffset;
+      const needed = size - resultPos;
+
+      if (available <= needed) {
+        result.set(buf.subarray(bufOffset), resultPos);
+        resultPos += available;
+        bufIdx++;
+        bufOffset = 0;
+      } else {
+        result.set(buf.subarray(bufOffset, bufOffset + needed), resultPos);
+        resultPos += needed;
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Consume bytes from the buffer.
+   *
+   * @param {number} size - Number of bytes to consume
+   * @returns {Uint8Array} Consumed bytes
+   */
+  _consume(size) {
+    if (this.bufferLen < size) {
+      throw new Error('Not enough data in buffer');
+    }
+
+    const result = new Uint8Array(size);
+    let resultPos = 0;
+
+    while (resultPos < size) {
+      const first = this.buffer[0];
+      const needed = size - resultPos;
+
+      if (first.length <= needed) {
+        result.set(first, resultPos);
+        resultPos += first.length;
+        this.buffer.shift();
+      } else {
+        result.set(first.subarray(0, needed), resultPos);
+        this.buffer[0] = first.subarray(needed);
+        resultPos += needed;
+      }
+    }
+
+    this.bufferLen -= size;
+    return result;
+  }
+
+  /**
+   * Process buffered data.
+   */
+  _process() {
+    try {
+      while (this.stack.length > 0) {
+        const node = this.stack[this.stack.length - 1];
+
+        if (node.len <= CHUNK_LEN) {
+          // Leaf node: need full chunk data
+          const chunkSize = node.len;
+          let chunk;
+
+          if (this.isOutboard) {
+            // Get chunk from outboard data
+            if (!this.outboardData && chunkSize > 0) {
+              throw new Error('Outboard data not set');
+            }
+            chunk = chunkSize > 0
+              ? this.outboardData.subarray(this.outboardPos, this.outboardPos + chunkSize)
+              : new Uint8Array(0);
+            this.outboardPos += chunkSize;
+          } else {
+            // Need chunk from encoded stream (0-byte chunks need no data)
+            if (chunkSize > 0 && this._available() < chunkSize) {
+              return; // Wait for more data
+            }
+            chunk = chunkSize > 0 ? this._consume(chunkSize) : new Uint8Array(0);
+          }
+
+          // Verify chunk
+          verifyChunk(node.cv, chunk, this.chunkIndex, node.isRoot);
+          this.chunkIndex++;
+          this.bytesDecoded += chunkSize;
+
+          // Output verified chunk (only if non-empty)
+          if (chunkSize > 0) {
+            this.outputBuffer.push(chunk);
+          }
+
+          // Pop from stack
+          this.stack.pop();
+
+        } else {
+          // Interior node: need parent data (64 bytes)
+          if (this._available() < PARENT_SIZE) {
+            return; // Wait for more data
+          }
+
+          const parent = this._consume(PARENT_SIZE);
+
+          // Verify parent
+          verifyParent(node.cv, parent, node.isRoot);
+
+          const leftCV = parent.subarray(0, HASH_SIZE);
+          const rightCV = parent.subarray(HASH_SIZE, PARENT_SIZE);
+          const lLen = leftLen(node.len);
+
+          // Pop current node
+          this.stack.pop();
+
+          // Push right first (so left is processed first - pre-order)
+          this.stack.push({
+            cv: new Uint8Array(rightCV), // Copy since parent buffer may be reused
+            start: node.start + lLen,
+            len: node.len - lLen,
+            isRoot: false
+          });
+
+          this.stack.push({
+            cv: new Uint8Array(leftCV),
+            start: node.start,
+            len: lLen,
+            isRoot: false
+          });
+        }
+      }
+
+      // If stack is empty and we've decoded all bytes, we're done
+      if (this.stack.length === 0 && this.bytesDecoded === this.contentLen) {
+        this.verified = true;
+      }
+    } catch (e) {
+      this.error = e.message;
+      throw e;
+    }
+  }
+
+  /**
+   * Read verified decoded data.
+   *
+   * @returns {Uint8Array} Verified decoded data available so far
+   */
+  read() {
+    if (this.outputBuffer.length === 0) {
+      return new Uint8Array(0);
+    }
+
+    // Concatenate all output chunks
+    const totalLen = this.outputBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+    const result = new Uint8Array(totalLen);
+    let pos = 0;
+    for (const chunk of this.outputBuffer) {
+      result.set(chunk, pos);
+      pos += chunk.length;
+    }
+
+    // Clear output buffer
+    this.outputBuffer = [];
+
+    return result;
+  }
+
+  /**
+   * Check if decoding is complete.
+   *
+   * @returns {boolean} True if all data has been verified
+   */
+  isComplete() {
+    return this.verified;
+  }
+
+  /**
+   * Finalize decoding and return all verified data.
+   *
+   * @returns {Uint8Array} Complete verified decoded data
+   * @throws {Error} If not all data has been received
+   */
+  finalize() {
+    if (!this.verified) {
+      if (this.error) {
+        throw new Error(`Decoding failed: ${this.error}`);
+      }
+      throw new Error('Incomplete data: not all bytes received');
+    }
+
+    return this.read();
+  }
+}
+
 // Exports
 module.exports = {
   // Core primitives
@@ -647,6 +1073,10 @@ module.exports = {
   verifyChunk,
   verifyParent,
   constantTimeEqual,
+
+  // Streaming API
+  BaoEncoder,
+  BaoDecoder,
 
   // Utilities
   countChunks,
