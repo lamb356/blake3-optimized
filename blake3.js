@@ -30,6 +30,9 @@
   const CHUNK_END = 2;
   const PARENT = 4;
   const ROOT = 8;
+  const KEYED_HASH = 16;
+  const DERIVE_KEY_CONTEXT = 32;
+  const DERIVE_KEY_MATERIAL = 64;
 
   const blockWords = new Uint32Array(16);
   let cvStack = null;
@@ -392,14 +395,250 @@
     return wasmSimdEnabled;
   }
 
+  // ============================================
+  // STREAMING API
+  // ============================================
+
+  // Helper to convert 32-byte key to 8 uint32 words (little-endian)
+  function keyToWords(key) {
+    if (key.length !== 32) {
+      throw new Error('Key must be exactly 32 bytes');
+    }
+    const words = new Uint32Array(8);
+    for (let i = 0; i < 8; i++) {
+      words[i] = key[i * 4] |
+                 (key[i * 4 + 1] << 8) |
+                 (key[i * 4 + 2] << 16) |
+                 (key[i * 4 + 3] << 24);
+    }
+    return words;
+  }
+
+  class Hasher {
+    constructor(key = null, flags = 0) {
+      // For keyed mode, key becomes the initial CV; otherwise use IV
+      if (key !== null) {
+        if (typeof key === 'string') {
+          key = new TextEncoder().encode(key);
+        }
+        if (!(key instanceof Uint8Array)) {
+          key = new Uint8Array(key);
+        }
+        this.keyWords = keyToWords(key);
+        // Only add KEYED_HASH if not already in a derive key mode
+        if (flags & (DERIVE_KEY_CONTEXT | DERIVE_KEY_MATERIAL)) {
+          this.baseFlags = flags;
+        } else {
+          this.baseFlags = flags | KEYED_HASH;
+        }
+      } else {
+        this.keyWords = IV;
+        this.baseFlags = flags;
+      }
+
+      this.cv = new Uint32Array(8);
+      this.cv.set(this.keyWords);
+      this.blockBuffer = new Uint8Array(BLOCK_LEN);
+      this.blockLen = 0;
+      this.chunkLen = 0;
+      this.chunkCounter = 0;
+      this.cvStack = [];
+    }
+
+    update(data) {
+      if (typeof data === 'string') {
+        data = new TextEncoder().encode(data);
+      }
+      if (!(data instanceof Uint8Array)) {
+        data = new Uint8Array(data);
+      }
+
+      let offset = 0;
+      const len = data.length;
+
+      while (offset < len) {
+        // If block buffer is full, compress it first
+        if (this.blockLen === BLOCK_LEN) {
+          const isLastBlockOfChunk = (this.chunkLen === CHUNK_LEN);
+          this._compressBlock(isLastBlockOfChunk);
+          this.blockLen = 0;
+
+          // If this completed a chunk, push CV and start new chunk
+          if (isLastBlockOfChunk) {
+            this._pushChunkCv();
+            this._startNewChunk();
+          }
+        }
+
+        const spaceInBlock = BLOCK_LEN - this.blockLen;
+        const spaceInChunk = CHUNK_LEN - this.chunkLen;
+        const spaceAvailable = Math.min(spaceInBlock, spaceInChunk);
+        const bytesToTake = Math.min(spaceAvailable, len - offset);
+
+        this.blockBuffer.set(data.subarray(offset, offset + bytesToTake), this.blockLen);
+        this.blockLen += bytesToTake;
+        this.chunkLen += bytesToTake;
+        offset += bytesToTake;
+      }
+
+      return this;
+    }
+
+    finalize(outputLen = 32) {
+      const out = new Uint32Array(8);
+      const hasData = this.chunkCounter > 0 || this.chunkLen > 0;
+
+      if (!hasData) {
+        blockWords.fill(0);
+        compress(this.keyWords, 0, blockWords, 0, out, 0, true, 0, 0, this.baseFlags | CHUNK_START | CHUNK_END | ROOT);
+        return wordsToBytes(out).slice(0, outputLen);
+      }
+
+      const isOnlyChunk = this.chunkCounter === 0;
+      const isRoot = isOnlyChunk && this.cvStack.length === 0;
+
+      this._compressBlock(true, isRoot);
+
+      if (isOnlyChunk) {
+        out.set(this.cv);
+      } else {
+        this.cvStack.push(new Uint32Array(this.cv));
+
+        while (this.cvStack.length > 1) {
+          const right = this.cvStack.pop();
+          const left = this.cvStack.pop();
+          const isRootMerge = this.cvStack.length === 0;
+
+          const parentBlock = new Uint32Array(16);
+          parentBlock.set(left, 0);
+          parentBlock.set(right, 8);
+
+          const merged = new Uint32Array(8);
+          compress(this.keyWords, 0, parentBlock, 0, merged, 0, true, 0, BLOCK_LEN, this.baseFlags | PARENT | (isRootMerge ? ROOT : 0));
+
+          if (isRootMerge) {
+            out.set(merged);
+          } else {
+            this.cvStack.push(merged);
+          }
+        }
+
+        if (this.cvStack.length === 1) {
+          out.set(this.cvStack[0]);
+        }
+      }
+
+      return wordsToBytes(out).slice(0, outputLen);
+    }
+
+    _pushChunkCv() {
+      this.cvStack.push(new Uint32Array(this.cv));
+      this.chunkCounter++;
+
+      let tc = this.chunkCounter;
+      while ((tc & 1) === 0 && this.cvStack.length >= 2) {
+        const right = this.cvStack.pop();
+        const left = this.cvStack.pop();
+
+        const parentBlock = new Uint32Array(16);
+        parentBlock.set(left, 0);
+        parentBlock.set(right, 8);
+
+        const merged = new Uint32Array(8);
+        compress(this.keyWords, 0, parentBlock, 0, merged, 0, true, 0, BLOCK_LEN, this.baseFlags | PARENT);
+        this.cvStack.push(merged);
+        tc >>= 1;
+      }
+    }
+
+    _startNewChunk() {
+      this.cv.set(this.keyWords);
+      this.chunkLen = 0;
+    }
+
+    _compressBlock(isLastBlock, isRoot = false) {
+      let flags = this.baseFlags;
+
+      if (this.chunkLen <= BLOCK_LEN) {
+        flags |= CHUNK_START;
+      }
+
+      if (isLastBlock) {
+        flags |= CHUNK_END;
+      }
+
+      if (isRoot) {
+        flags |= ROOT;
+      }
+
+      const localBlockWords = new Uint32Array(16);
+      for (let i = 0; i < this.blockLen; i++) {
+        localBlockWords[i >> 2] |= this.blockBuffer[i] << ((i & 3) * 8);
+      }
+
+      compress(this.cv, 0, localBlockWords, 0, this.cv, 0, true, this.chunkCounter, this.blockLen, flags);
+    }
+  }
+
+  function createHasher() {
+    return new Hasher();
+  }
+
+  function createKeyedHasher(key) {
+    if (typeof key === 'string') {
+      key = new TextEncoder().encode(key);
+    }
+    if (!(key instanceof Uint8Array)) {
+      key = new Uint8Array(key);
+    }
+    if (key.length !== 32) {
+      throw new Error('Key must be exactly 32 bytes');
+    }
+    return new Hasher(key);
+  }
+
+  function hashKeyed(key, input, outputLen = 32) {
+    const hasher = createKeyedHasher(key);
+    hasher.update(input);
+    return hasher.finalize(outputLen);
+  }
+
+  /**
+   * Derive a key using BLAKE3 KDF
+   * @param {string} context - Context string (domain separator)
+   * @param {Uint8Array|string} keyMaterial - Input key material
+   * @param {number} outputLen - Desired output length in bytes (default 32)
+   * @returns {Uint8Array} Derived key
+   */
+  function deriveKey(context, keyMaterial, outputLen = 32) {
+    // Step 1: Hash context string with DERIVE_KEY_CONTEXT flag to get context key
+    // This uses IV as initial CV
+    const contextHasher = new Hasher(null, DERIVE_KEY_CONTEXT);
+    contextHasher.update(context);
+    const contextKey = contextHasher.finalize(32);
+
+    // Step 2: Hash key material using context key with DERIVE_KEY_MATERIAL flag
+    const materialHasher = new Hasher(contextKey, DERIVE_KEY_MATERIAL);
+    materialHasher.update(keyMaterial);
+    return materialHasher.finalize(outputLen);
+  }
+
   exports.hash = hash;
   exports.hashHex = hashHex;
   exports.toHex = toHex;
   exports.initSimd = initSimd;
   exports.isSimdEnabled = isSimdEnabled;
+  exports.createHasher = createHasher;
+  exports.createKeyedHasher = createKeyedHasher;
+  exports.hashKeyed = hashKeyed;
+  exports.deriveKey = deriveKey;
+  exports.Hasher = Hasher;
   exports.IV = IV;
   exports.BLOCK_LEN = BLOCK_LEN;
   exports.CHUNK_LEN = CHUNK_LEN;
+  exports.KEYED_HASH = KEYED_HASH;
+  exports.DERIVE_KEY_CONTEXT = DERIVE_KEY_CONTEXT;
+  exports.DERIVE_KEY_MATERIAL = DERIVE_KEY_MATERIAL;
 
   // Debug exports for SIMD testing
   exports._compress = compress;
