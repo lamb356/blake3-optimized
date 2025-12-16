@@ -387,6 +387,11 @@ function baoDecode(encoded, rootHash, outboardData = null) {
         treePos += subtreeLen;
       }
 
+      // Verify we got the expected amount of data
+      if (chunk.length !== subtreeLen) {
+        throw new Error(`Truncated chunk: expected ${subtreeLen} bytes, got ${chunk.length}`);
+      }
+
       verifyChunk(subtreeCV, chunk, chunkIndex, isRoot);
       chunkIndex++;
 
