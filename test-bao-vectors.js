@@ -4,11 +4,12 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 const blake3 = require('./blake3.js');
 const bao = require('./bao.js');
 
 // Load official test vectors
-const vectors = JSON.parse(fs.readFileSync('./test-vectors.json', 'utf8'));
+const vectors = JSON.parse(fs.readFileSync(path.join(__dirname, 'test-vectors.json'), 'utf8'));
 
 function toHex(bytes) {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');

@@ -1057,6 +1057,1166 @@ class BaoDecoder {
   }
 }
 
+// ============================================
+// IROH CHUNK GROUP SUPPORT
+// ============================================
+
+/**
+ * Iroh uses chunk groups to reduce outboard size.
+ * A chunk group of 2^N chunks means we only store parent nodes
+ * at or above the chunk group level in outboard format.
+ *
+ * Default Iroh uses chunkGroupLog=4 (16 chunks = 16 KiB groups)
+ * This reduces outboard size by ~16x compared to standard Bao.
+ */
+
+const IROH_CHUNK_GROUP_LOG = 4;  // 2^4 = 16 chunks per group
+const IROH_CHUNK_GROUP_SIZE = CHUNK_LEN * (1 << IROH_CHUNK_GROUP_LOG);  // 16384 bytes
+
+/**
+ * Count chunk groups for a given content length.
+ *
+ * @param {number} contentLen - Content length in bytes
+ * @param {number} chunkGroupLog - Log2 of chunks per group (default 4)
+ * @returns {number} Number of chunk groups
+ */
+function countChunkGroups(contentLen, chunkGroupLog = IROH_CHUNK_GROUP_LOG) {
+  const groupSize = CHUNK_LEN * (1 << chunkGroupLog);
+  if (contentLen === 0) return 1;
+  return Math.ceil(contentLen / groupSize);
+}
+
+/**
+ * Calculate outboard size for Iroh format (chunk groups).
+ * Only stores parent nodes at or above chunk group level.
+ *
+ * @param {number} contentLen - Content length in bytes
+ * @param {number} chunkGroupLog - Log2 of chunks per group
+ * @returns {number} Outboard size in bytes
+ */
+function irohOutboardSize(contentLen, chunkGroupLog = IROH_CHUNK_GROUP_LOG) {
+  const numGroups = countChunkGroups(contentLen, chunkGroupLog);
+  // N groups = N-1 parent nodes at group level, each 64 bytes
+  return HEADER_SIZE + (numGroups - 1) * PARENT_SIZE;
+}
+
+/**
+ * Compute the chaining value for a chunk group.
+ * This computes the subtree hash for a group of chunks.
+ *
+ * @param {Uint8Array} groupData - Data for this chunk group
+ * @param {number} startChunkIndex - Index of first chunk in group
+ * @param {boolean} isRoot - Whether this is the root (only if single group)
+ * @returns {Uint8Array} 32-byte chaining value for the group
+ */
+function chunkGroupCV(groupData, startChunkIndex, isRoot) {
+  const numChunks = Math.ceil(groupData.length / CHUNK_LEN) || 1;
+
+  if (numChunks === 1) {
+    // Single chunk - just compute chunk CV
+    return chunkCV(groupData, startChunkIndex, isRoot);
+  }
+
+  // Multiple chunks - build subtree
+  // Compute all chunk CVs first
+  const chunkCVs = [];
+  for (let i = 0; i < numChunks; i++) {
+    const chunkStart = i * CHUNK_LEN;
+    const chunkEnd = Math.min(chunkStart + CHUNK_LEN, groupData.length);
+    const chunk = groupData.subarray(chunkStart, chunkEnd);
+    chunkCVs.push(chunkCV(chunk, startChunkIndex + i, false));
+  }
+
+  // Build tree bottom-up
+  while (chunkCVs.length > 1) {
+    const newLevel = [];
+    for (let i = 0; i < chunkCVs.length; i += 2) {
+      if (i + 1 < chunkCVs.length) {
+        // Pair available
+        const isRootNode = isRoot && newLevel.length === 0 && i + 2 >= chunkCVs.length;
+        newLevel.push(parentCV(chunkCVs[i], chunkCVs[i + 1], isRootNode));
+      } else {
+        // Odd one out - promote to next level
+        newLevel.push(chunkCVs[i]);
+      }
+    }
+    chunkCVs.length = 0;
+    chunkCVs.push(...newLevel);
+  }
+
+  return chunkCVs[0];
+}
+
+/**
+ * Encode data in Iroh-compatible Bao format with chunk groups.
+ *
+ * The hash is identical to standard Bao (same BLAKE3 tree).
+ * In outboard mode, only parent nodes at chunk group level are stored.
+ *
+ * @param {Uint8Array} buf - Input data
+ * @param {boolean} outboard - If true, produce outboard format
+ * @param {number} chunkGroupLog - Log2 of chunks per group (default 4 = 16 chunks)
+ * @returns {{ encoded: Uint8Array, hash: Uint8Array }} Encoded data and root hash
+ */
+function baoEncodeIroh(buf, outboard = false, chunkGroupLog = IROH_CHUNK_GROUP_LOG) {
+  if (typeof buf === 'string') {
+    buf = new TextEncoder().encode(buf);
+  }
+  if (!(buf instanceof Uint8Array)) {
+    buf = new Uint8Array(buf);
+  }
+
+  // For combined mode, use standard encoding (no difference)
+  if (!outboard) {
+    return baoEncode(buf, false);
+  }
+
+  // For outboard mode with chunk groups:
+  // 1. Compute chunk group CVs
+  // 2. Build tree from group CVs only
+  // 3. Store only group-level parent nodes
+
+  const groupSize = CHUNK_LEN * (1 << chunkGroupLog);
+  const numGroups = countChunkGroups(buf.length, chunkGroupLog);
+
+  if (numGroups === 1) {
+    // Single group - just compute root hash, no parent nodes needed
+    const rootHash = chunkGroupCV(buf, 0, true);
+    const header = encodeLen(buf.length);
+    return { encoded: header, hash: rootHash };
+  }
+
+  // Multiple groups - compute group CVs and build tree
+  const groupCVs = [];
+  for (let g = 0; g < numGroups; g++) {
+    const groupStart = g * groupSize;
+    const groupEnd = Math.min(groupStart + groupSize, buf.length);
+    const groupData = buf.subarray(groupStart, groupEnd);
+    const startChunkIndex = g * (1 << chunkGroupLog);
+    groupCVs.push(chunkGroupCV(groupData, startChunkIndex, false));
+  }
+
+  // Build tree from group CVs using same left-len split as standard Bao
+  // but operating on groups instead of chunks
+  function encodeGroupTree(cvs, isRoot) {
+    if (cvs.length === 1) {
+      return { encoded: new Uint8Array(0), cv: cvs[0] };
+    }
+
+    if (cvs.length === 2) {
+      const parentNode = new Uint8Array(64);
+      parentNode.set(cvs[0], 0);
+      parentNode.set(cvs[1], 32);
+      const cv = parentCV(cvs[0], cvs[1], isRoot);
+      return { encoded: parentNode, cv };
+    }
+
+    // Split using power-of-two rule
+    const leftCount = 1 << (Math.floor(Math.log2(cvs.length - 1)));
+    const leftCVs = cvs.slice(0, leftCount);
+    const rightCVs = cvs.slice(leftCount);
+
+    const leftResult = encodeGroupTree(leftCVs, false);
+    const rightResult = encodeGroupTree(rightCVs, false);
+
+    const parentNode = new Uint8Array(64);
+    parentNode.set(leftResult.cv, 0);
+    parentNode.set(rightResult.cv, 32);
+
+    const cv = parentCV(leftResult.cv, rightResult.cv, isRoot);
+
+    const encoded = new Uint8Array(64 + leftResult.encoded.length + rightResult.encoded.length);
+    encoded.set(parentNode, 0);
+    encoded.set(leftResult.encoded, 64);
+    encoded.set(rightResult.encoded, 64 + leftResult.encoded.length);
+
+    return { encoded, cv };
+  }
+
+  const result = encodeGroupTree(groupCVs, true);
+  const header = encodeLen(buf.length);
+  const output = new Uint8Array(header.length + result.encoded.length);
+  output.set(header, 0);
+  output.set(result.encoded, header.length);
+
+  return { encoded: output, hash: result.cv };
+}
+
+/**
+ * Decode and verify Iroh-format Bao encoding.
+ *
+ * @param {Uint8Array} encoded - Iroh outboard encoding
+ * @param {Uint8Array} rootHash - Expected 32-byte root hash
+ * @param {Uint8Array} data - Original data (required for outboard)
+ * @param {number} chunkGroupLog - Log2 of chunks per group
+ * @returns {Uint8Array} Verified data
+ */
+function baoDecodeIroh(encoded, rootHash, data, chunkGroupLog = IROH_CHUNK_GROUP_LOG) {
+  if (encoded.length < HEADER_SIZE) {
+    throw new Error('Encoded data too short: missing header');
+  }
+
+  if (rootHash.length !== HASH_SIZE) {
+    throw new Error(`Root hash must be ${HASH_SIZE} bytes`);
+  }
+
+  const contentLen = decodeLen(encoded.subarray(0, HEADER_SIZE));
+
+  if (data.length !== contentLen) {
+    throw new Error(`Data length mismatch: expected ${contentLen}, got ${data.length}`);
+  }
+
+  const groupSize = CHUNK_LEN * (1 << chunkGroupLog);
+  const numGroups = countChunkGroups(contentLen, chunkGroupLog);
+
+  // Compute expected group CVs from data
+  const groupCVs = [];
+  for (let g = 0; g < numGroups; g++) {
+    const groupStart = g * groupSize;
+    const groupEnd = Math.min(groupStart + groupSize, data.length);
+    const groupData = data.subarray(groupStart, groupEnd);
+    const startChunkIndex = g * (1 << chunkGroupLog);
+    groupCVs.push(chunkGroupCV(groupData, startChunkIndex, false));
+  }
+
+  let treePos = HEADER_SIZE;
+
+  // Verify tree structure
+  function verifyGroupTree(cvs, expectedCV, isRoot) {
+    if (cvs.length === 1) {
+      // Single group - verify directly against expected CV
+      // The computed CV should match the expected CV from parent (or root hash)
+      if (!constantTimeEqual(cvs[0], expectedCV)) {
+        throw new Error(isRoot ? 'Root hash mismatch' : 'Group CV mismatch');
+      }
+      return;
+    }
+
+    if (cvs.length >= 2) {
+      // Read parent node from encoding
+      const parent = encoded.subarray(treePos, treePos + PARENT_SIZE);
+      treePos += PARENT_SIZE;
+
+      // Verify parent hash
+      verifyParent(expectedCV, parent, isRoot);
+
+      const leftCV = parent.subarray(0, HASH_SIZE);
+      const rightCV = parent.subarray(HASH_SIZE, PARENT_SIZE);
+
+      // Split using same rule as encoding
+      const leftCount = 1 << (Math.floor(Math.log2(cvs.length - 1)));
+      const leftCVs = cvs.slice(0, leftCount);
+      const rightCVs = cvs.slice(leftCount);
+
+      verifyGroupTree(leftCVs, leftCV, false);
+      verifyGroupTree(rightCVs, rightCV, false);
+    }
+  }
+
+  if (numGroups === 1) {
+    // Single group - just verify root hash
+    const actualHash = chunkGroupCV(data, 0, true);
+    if (!constantTimeEqual(actualHash, rootHash)) {
+      throw new Error('Root hash mismatch');
+    }
+  } else {
+    verifyGroupTree(groupCVs, rootHash, true);
+  }
+
+  return data;
+}
+
+/**
+ * Verify data against Iroh outboard encoding.
+ * Convenience function that returns boolean instead of throwing.
+ *
+ * @param {Uint8Array} outboard - Iroh outboard encoding
+ * @param {Uint8Array} rootHash - Expected root hash
+ * @param {Uint8Array} data - Data to verify
+ * @param {number} chunkGroupLog - Log2 of chunks per group
+ * @returns {boolean} True if verification passes
+ */
+function baoVerifyIroh(outboard, rootHash, data, chunkGroupLog = IROH_CHUNK_GROUP_LOG) {
+  try {
+    baoDecodeIroh(outboard, rootHash, data, chunkGroupLog);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ============================================
+// BITFIELD HELPERS
+// ============================================
+
+/**
+ * Create an empty bitfield with the given number of bits.
+ * @param {number} numBits - Number of bits in the bitfield
+ * @returns {Uint8Array} Bitfield with all bits set to 0
+ */
+function createBitfield(numBits) {
+  const numBytes = Math.ceil(numBits / 8);
+  return new Uint8Array(numBytes);
+}
+
+/**
+ * Set a bit at the given index.
+ * @param {Uint8Array} bitfield - The bitfield
+ * @param {number} index - Bit index to set
+ */
+function setBit(bitfield, index) {
+  const byteIndex = Math.floor(index / 8);
+  const bitIndex = index % 8;
+  if (byteIndex < bitfield.length) {
+    bitfield[byteIndex] |= (1 << bitIndex);
+  }
+}
+
+/**
+ * Clear a bit at the given index.
+ * @param {Uint8Array} bitfield - The bitfield
+ * @param {number} index - Bit index to clear
+ */
+function clearBit(bitfield, index) {
+  const byteIndex = Math.floor(index / 8);
+  const bitIndex = index % 8;
+  if (byteIndex < bitfield.length) {
+    bitfield[byteIndex] &= ~(1 << bitIndex);
+  }
+}
+
+/**
+ * Get a bit at the given index.
+ * @param {Uint8Array} bitfield - The bitfield
+ * @param {number} index - Bit index to get
+ * @returns {boolean} True if bit is set
+ */
+function getBit(bitfield, index) {
+  const byteIndex = Math.floor(index / 8);
+  const bitIndex = index % 8;
+  if (byteIndex >= bitfield.length) return false;
+  return (bitfield[byteIndex] & (1 << bitIndex)) !== 0;
+}
+
+/**
+ * Count the number of set bits in a bitfield.
+ * @param {Uint8Array} bitfield - The bitfield
+ * @param {number} numBits - Total number of valid bits (to handle partial last byte)
+ * @returns {number} Number of set bits
+ */
+function countSetBits(bitfield, numBits = bitfield.length * 8) {
+  let count = 0;
+  for (let i = 0; i < numBits; i++) {
+    if (getBit(bitfield, i)) count++;
+  }
+  return count;
+}
+
+// ============================================
+// PARTIAL BAO - RESUMABLE DOWNLOADS
+// ============================================
+
+/**
+ * PartialBao class for tracking incomplete file downloads.
+ * Enables resumable downloads and multi-source fetching by tracking
+ * which chunk groups have been downloaded and verified.
+ */
+class PartialBao {
+  /**
+   * Create a new PartialBao instance.
+   * @param {Uint8Array} rootHash - Expected 32-byte root hash
+   * @param {number} contentLen - Total content length in bytes
+   * @param {number} chunkGroupLog - Log2 of chunks per group (default 4 = 16 chunks)
+   */
+  constructor(rootHash, contentLen, chunkGroupLog = IROH_CHUNK_GROUP_LOG) {
+    if (rootHash.length !== HASH_SIZE) {
+      throw new Error(`Root hash must be ${HASH_SIZE} bytes`);
+    }
+    if (contentLen < 0) {
+      throw new Error('Content length must be non-negative');
+    }
+
+    this.rootHash = new Uint8Array(rootHash);
+    this.contentLen = contentLen;
+    this.chunkGroupLog = chunkGroupLog;
+    this.groupSize = CHUNK_LEN * (1 << chunkGroupLog);
+
+    // Calculate number of groups
+    this._numGroups = countChunkGroups(contentLen, chunkGroupLog);
+
+    // Create bitfield to track which groups are present
+    this.bitfield = createBitfield(this._numGroups);
+
+    // Storage for chunk group data
+    this.groupData = new Map();
+
+    // Cache for verified parent nodes (for proof verification)
+    this.verifiedNodes = new Map();
+  }
+
+  /**
+   * Get the total number of chunk groups.
+   * @returns {number}
+   */
+  get numGroups() {
+    return this._numGroups;
+  }
+
+  /**
+   * Get the number of groups that have been received.
+   * @returns {number}
+   */
+  get receivedGroups() {
+    return countSetBits(this.bitfield, this._numGroups);
+  }
+
+  /**
+   * Check if all groups have been received.
+   * @returns {boolean}
+   */
+  isComplete() {
+    return this.receivedGroups === this._numGroups;
+  }
+
+  /**
+   * Get completion percentage.
+   * @returns {number} Percentage from 0 to 100
+   */
+  getProgress() {
+    if (this._numGroups === 0) return 100;
+    return (this.receivedGroups / this._numGroups) * 100;
+  }
+
+  /**
+   * Check if a specific group has been received.
+   * @param {number} groupIndex - Group index
+   * @returns {boolean}
+   */
+  hasGroup(groupIndex) {
+    if (groupIndex < 0 || groupIndex >= this._numGroups) return false;
+    return getBit(this.bitfield, groupIndex);
+  }
+
+  /**
+   * Get the expected size of a chunk group.
+   * @param {number} groupIndex - Group index
+   * @returns {number} Expected size in bytes
+   */
+  getGroupSize(groupIndex) {
+    if (groupIndex < 0 || groupIndex >= this._numGroups) {
+      throw new Error(`Invalid group index: ${groupIndex}`);
+    }
+
+    const groupStart = groupIndex * this.groupSize;
+    const groupEnd = Math.min(groupStart + this.groupSize, this.contentLen);
+    return groupEnd - groupStart;
+  }
+
+  /**
+   * Add a verified chunk group.
+   *
+   * @param {number} groupIndex - Index of the chunk group (0-based)
+   * @param {Uint8Array} data - The chunk group data
+   * @param {Uint8Array[]} proof - Array of sibling hashes from leaf to root
+   * @returns {boolean} True if the group was added successfully
+   */
+  addChunkGroup(groupIndex, data, proof) {
+    if (groupIndex < 0 || groupIndex >= this._numGroups) {
+      throw new Error(`Invalid group index: ${groupIndex}`);
+    }
+
+    // Check if already have this group
+    if (this.hasGroup(groupIndex)) {
+      return true; // Already have it
+    }
+
+    // Verify data length
+    const expectedSize = this.getGroupSize(groupIndex);
+    if (data.length !== expectedSize) {
+      throw new Error(`Data length mismatch: expected ${expectedSize}, got ${data.length}`);
+    }
+
+    // Compute the chunk group CV
+    const startChunkIndex = groupIndex * (1 << this.chunkGroupLog);
+    const isOnlyGroup = this._numGroups === 1;
+    const groupCV = chunkGroupCV(data, startChunkIndex, isOnlyGroup);
+
+    // Verify against proof (or root hash if single group)
+    if (isOnlyGroup) {
+      // Single group - verify directly against root hash
+      if (!constantTimeEqual(groupCV, this.rootHash)) {
+        throw new Error('Group CV does not match root hash');
+      }
+    } else {
+      // Multiple groups - verify proof
+      if (!this._verifyProof(groupIndex, groupCV, proof)) {
+        throw new Error('Proof verification failed');
+      }
+    }
+
+    // Store the data
+    this.groupData.set(groupIndex, new Uint8Array(data));
+    setBit(this.bitfield, groupIndex);
+
+    return true;
+  }
+
+  /**
+   * Verify a Merkle proof for a chunk group.
+   * @private
+   */
+  _verifyProof(groupIndex, leafCV, proof) {
+    if (!proof || proof.length === 0) {
+      // No proof provided - cannot verify
+      return false;
+    }
+
+    let currentCV = leafCV;
+    let index = groupIndex;
+    let levelSize = this._numGroups;
+
+    for (let i = 0; i < proof.length; i++) {
+      const siblingCV = proof[i];
+
+      if (siblingCV.length !== HASH_SIZE) {
+        return false;
+      }
+
+      // Determine if we're on the left or right
+      const isRight = index % 2 === 1;
+      const isRoot = i === proof.length - 1;
+
+      if (isRight) {
+        currentCV = parentCV(siblingCV, currentCV, isRoot);
+      } else {
+        currentCV = parentCV(currentCV, siblingCV, isRoot);
+      }
+
+      // Move up the tree
+      index = Math.floor(index / 2);
+      levelSize = Math.ceil(levelSize / 2);
+    }
+
+    // Final CV should match root hash
+    return constantTimeEqual(currentCV, this.rootHash);
+  }
+
+  /**
+   * Add a chunk group without proof verification.
+   * Use this when you trust the source or have already verified.
+   *
+   * @param {number} groupIndex - Index of the chunk group
+   * @param {Uint8Array} data - The chunk group data
+   */
+  addChunkGroupTrusted(groupIndex, data) {
+    if (groupIndex < 0 || groupIndex >= this._numGroups) {
+      throw new Error(`Invalid group index: ${groupIndex}`);
+    }
+
+    const expectedSize = this.getGroupSize(groupIndex);
+    if (data.length !== expectedSize) {
+      throw new Error(`Data length mismatch: expected ${expectedSize}, got ${data.length}`);
+    }
+
+    this.groupData.set(groupIndex, new Uint8Array(data));
+    setBit(this.bitfield, groupIndex);
+  }
+
+  /**
+   * Get the data for a specific chunk group.
+   * @param {number} groupIndex - Group index
+   * @returns {Uint8Array|null} The group data, or null if not present
+   */
+  getGroupData(groupIndex) {
+    return this.groupData.get(groupIndex) || null;
+  }
+
+  /**
+   * Get the bitfield as a Uint8Array.
+   * @returns {Uint8Array} Copy of the bitfield
+   */
+  getBitfield() {
+    return new Uint8Array(this.bitfield);
+  }
+
+  /**
+   * Set the bitfield (for loading saved state).
+   * Note: This only sets which groups are marked as present,
+   * not the actual data. Use with caution.
+   *
+   * @param {Uint8Array} bitfield - Bitfield to set
+   */
+  setBitfield(bitfield) {
+    const expectedBytes = Math.ceil(this._numGroups / 8);
+    if (bitfield.length !== expectedBytes) {
+      throw new Error(`Bitfield length mismatch: expected ${expectedBytes}, got ${bitfield.length}`);
+    }
+    this.bitfield = new Uint8Array(bitfield);
+  }
+
+  /**
+   * Get ranges of missing chunk groups.
+   * @returns {Array<{start: number, end: number}>} Array of ranges (inclusive start, exclusive end)
+   */
+  getMissingRanges() {
+    const ranges = [];
+    let rangeStart = null;
+
+    for (let i = 0; i < this._numGroups; i++) {
+      const present = getBit(this.bitfield, i);
+
+      if (!present && rangeStart === null) {
+        // Start of a missing range
+        rangeStart = i;
+      } else if (present && rangeStart !== null) {
+        // End of a missing range
+        ranges.push({ start: rangeStart, end: i });
+        rangeStart = null;
+      }
+    }
+
+    // Handle range that extends to the end
+    if (rangeStart !== null) {
+      ranges.push({ start: rangeStart, end: this._numGroups });
+    }
+
+    return ranges;
+  }
+
+  /**
+   * Get ranges of present chunk groups.
+   * @returns {Array<{start: number, end: number}>} Array of ranges (inclusive start, exclusive end)
+   */
+  getPresentRanges() {
+    const ranges = [];
+    let rangeStart = null;
+
+    for (let i = 0; i < this._numGroups; i++) {
+      const present = getBit(this.bitfield, i);
+
+      if (present && rangeStart === null) {
+        // Start of a present range
+        rangeStart = i;
+      } else if (!present && rangeStart !== null) {
+        // End of a present range
+        ranges.push({ start: rangeStart, end: i });
+        rangeStart = null;
+      }
+    }
+
+    // Handle range that extends to the end
+    if (rangeStart !== null) {
+      ranges.push({ start: rangeStart, end: this._numGroups });
+    }
+
+    return ranges;
+  }
+
+  /**
+   * Get the list of missing group indices.
+   * @returns {number[]} Array of missing group indices
+   */
+  getMissingGroups() {
+    const missing = [];
+    for (let i = 0; i < this._numGroups; i++) {
+      if (!getBit(this.bitfield, i)) {
+        missing.push(i);
+      }
+    }
+    return missing;
+  }
+
+  /**
+   * Get the list of present group indices.
+   * @returns {number[]} Array of present group indices
+   */
+  getPresentGroups() {
+    const present = [];
+    for (let i = 0; i < this._numGroups; i++) {
+      if (getBit(this.bitfield, i)) {
+        present.push(i);
+      }
+    }
+    return present;
+  }
+
+  /**
+   * Finalize and return the complete data.
+   * Throws if not all groups have been received.
+   *
+   * @param {boolean} verify - If true, verify the final hash (default true)
+   * @returns {Uint8Array} The complete file data
+   */
+  finalize(verify = true) {
+    if (!this.isComplete()) {
+      const missing = this.getMissingGroups();
+      throw new Error(`Cannot finalize: missing ${missing.length} groups: [${missing.slice(0, 5).join(', ')}${missing.length > 5 ? '...' : ''}]`);
+    }
+
+    // Assemble the complete data
+    const data = new Uint8Array(this.contentLen);
+    for (let i = 0; i < this._numGroups; i++) {
+      const groupData = this.groupData.get(i);
+      const offset = i * this.groupSize;
+      data.set(groupData, offset);
+    }
+
+    // Optionally verify the final hash
+    if (verify) {
+      const computedHash = chunkGroupCV(data, 0, true);
+      if (!constantTimeEqual(computedHash, this.rootHash)) {
+        throw new Error('Final hash verification failed');
+      }
+    }
+
+    return data;
+  }
+
+  /**
+   * Export the current state for serialization.
+   * @returns {Object} Serializable state object
+   */
+  exportState() {
+    // Convert groupData Map to array of [index, base64] pairs
+    const groupDataArray = [];
+    for (const [index, data] of this.groupData.entries()) {
+      groupDataArray.push([index, Array.from(data)]);
+    }
+
+    return {
+      rootHash: Array.from(this.rootHash),
+      contentLen: this.contentLen,
+      chunkGroupLog: this.chunkGroupLog,
+      bitfield: Array.from(this.bitfield),
+      groupData: groupDataArray
+    };
+  }
+
+  /**
+   * Import state from a serialized object.
+   * @param {Object} state - State object from exportState()
+   * @returns {PartialBao} New PartialBao instance
+   */
+  static importState(state) {
+    const partial = new PartialBao(
+      new Uint8Array(state.rootHash),
+      state.contentLen,
+      state.chunkGroupLog
+    );
+
+    partial.bitfield = new Uint8Array(state.bitfield);
+
+    for (const [index, dataArray] of state.groupData) {
+      partial.groupData.set(index, new Uint8Array(dataArray));
+    }
+
+    return partial;
+  }
+
+  /**
+   * Create a Merkle proof for a chunk group.
+   * Requires all groups to be present.
+   *
+   * @param {number} groupIndex - Group index to create proof for
+   * @returns {Uint8Array[]} Array of sibling hashes from leaf to root
+   */
+  createProof(groupIndex) {
+    if (!this.isComplete()) {
+      throw new Error('Cannot create proof: not all groups present');
+    }
+
+    if (groupIndex < 0 || groupIndex >= this._numGroups) {
+      throw new Error(`Invalid group index: ${groupIndex}`);
+    }
+
+    if (this._numGroups === 1) {
+      // Single group - no proof needed
+      return [];
+    }
+
+    // Compute all group CVs
+    const groupCVs = [];
+    for (let i = 0; i < this._numGroups; i++) {
+      const data = this.groupData.get(i);
+      const startChunkIndex = i * (1 << this.chunkGroupLog);
+      groupCVs.push(chunkGroupCV(data, startChunkIndex, false));
+    }
+
+    // Build proof by walking up the tree
+    const proof = [];
+    let cvs = groupCVs;
+    let index = groupIndex;
+
+    while (cvs.length > 1) {
+      // Get sibling
+      const siblingIndex = index % 2 === 0 ? index + 1 : index - 1;
+
+      if (siblingIndex < cvs.length) {
+        proof.push(new Uint8Array(cvs[siblingIndex]));
+      } else {
+        // No sibling (odd number of nodes) - use self as placeholder
+        // This shouldn't normally happen in a proper proof
+        proof.push(new Uint8Array(cvs[index]));
+      }
+
+      // Build next level
+      const nextLevel = [];
+      const isLastLevel = cvs.length <= 2;
+
+      for (let i = 0; i < cvs.length; i += 2) {
+        if (i + 1 < cvs.length) {
+          const isRoot = isLastLevel && i === 0;
+          nextLevel.push(parentCV(cvs[i], cvs[i + 1], isRoot));
+        } else {
+          // Odd one out - promote
+          nextLevel.push(cvs[i]);
+        }
+      }
+
+      cvs = nextLevel;
+      index = Math.floor(index / 2);
+    }
+
+    return proof;
+  }
+}
+
+// ============================================
+// HASH SEQUENCES - BLOB COLLECTIONS
+// ============================================
+
+/**
+ * HashSequence - Ordered list of blob hashes representing a collection.
+ *
+ * Hash sequences are used to represent collections like directories or datasets.
+ * The sequence itself has a hash, allowing the entire collection to be verified
+ * with a single hash.
+ *
+ * Format (matching Iroh):
+ * - Header: 4-byte little-endian count of hashes
+ * - Body: Concatenated 32-byte hashes
+ * - Total size: 4 + (count * 32) bytes
+ *
+ * The sequence hash is the BLAKE3 hash of the serialized bytes.
+ */
+class HashSequence {
+  /**
+   * Create a new HashSequence.
+   * @param {Uint8Array[]} [hashes] - Optional initial array of 32-byte hashes
+   */
+  constructor(hashes = []) {
+    this._hashes = [];
+    for (const hash of hashes) {
+      this.addHash(hash);
+    }
+  }
+
+  /**
+   * Add a hash to the sequence.
+   * @param {Uint8Array} hash - 32-byte hash to add
+   * @returns {HashSequence} this (for chaining)
+   */
+  addHash(hash) {
+    if (!(hash instanceof Uint8Array)) {
+      throw new Error('Hash must be a Uint8Array');
+    }
+    if (hash.length !== HASH_SIZE) {
+      throw new Error(`Hash must be ${HASH_SIZE} bytes, got ${hash.length}`);
+    }
+    this._hashes.push(new Uint8Array(hash));
+    return this;
+  }
+
+  /**
+   * Get the number of hashes in the sequence.
+   * @returns {number}
+   */
+  get length() {
+    return this._hashes.length;
+  }
+
+  /**
+   * Get hash at the specified index.
+   * @param {number} index - Index of hash to get
+   * @returns {Uint8Array} Copy of the 32-byte hash
+   */
+  getHash(index) {
+    if (index < 0 || index >= this._hashes.length) {
+      throw new Error(`Index out of bounds: ${index}`);
+    }
+    return new Uint8Array(this._hashes[index]);
+  }
+
+  /**
+   * Check if the sequence contains a specific hash.
+   * @param {Uint8Array} hash - Hash to search for
+   * @returns {boolean}
+   */
+  hasHash(hash) {
+    return this.indexOf(hash) !== -1;
+  }
+
+  /**
+   * Find the index of a hash in the sequence.
+   * @param {Uint8Array} hash - Hash to search for
+   * @returns {number} Index of hash, or -1 if not found
+   */
+  indexOf(hash) {
+    if (!(hash instanceof Uint8Array) || hash.length !== HASH_SIZE) {
+      return -1;
+    }
+    for (let i = 0; i < this._hashes.length; i++) {
+      if (constantTimeEqual(this._hashes[i], hash)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Iterator for the sequence.
+   * @yields {Uint8Array} Each hash in order
+   */
+  *[Symbol.iterator]() {
+    for (const hash of this._hashes) {
+      yield new Uint8Array(hash);
+    }
+  }
+
+  /**
+   * Get all hashes as an array.
+   * @returns {Uint8Array[]} Array of hash copies
+   */
+  toArray() {
+    return this._hashes.map(h => new Uint8Array(h));
+  }
+
+  /**
+   * Compute the sequence hash (BLAKE3 of serialized bytes).
+   * @returns {Uint8Array} 32-byte hash of the sequence
+   */
+  finalize() {
+    const bytes = this.toBytes();
+    return blake3.hash(bytes);
+  }
+
+  /**
+   * Serialize to bytes.
+   * Format: 4-byte LE count + concatenated 32-byte hashes
+   * @returns {Uint8Array} Serialized sequence
+   */
+  toBytes() {
+    const count = this._hashes.length;
+    const totalSize = 4 + count * HASH_SIZE;
+    const bytes = new Uint8Array(totalSize);
+
+    // Write 4-byte little-endian count
+    bytes[0] = count & 0xff;
+    bytes[1] = (count >> 8) & 0xff;
+    bytes[2] = (count >> 16) & 0xff;
+    bytes[3] = (count >> 24) & 0xff;
+
+    // Write concatenated hashes
+    for (let i = 0; i < count; i++) {
+      bytes.set(this._hashes[i], 4 + i * HASH_SIZE);
+    }
+
+    return bytes;
+  }
+
+  /**
+   * Deserialize from bytes.
+   * @param {Uint8Array} bytes - Serialized sequence
+   * @returns {HashSequence} New HashSequence instance
+   */
+  static fromBytes(bytes) {
+    if (!(bytes instanceof Uint8Array)) {
+      throw new Error('Input must be a Uint8Array');
+    }
+    if (bytes.length < 4) {
+      throw new Error('Input too short: missing header');
+    }
+
+    // Read 4-byte little-endian count
+    const count = bytes[0] |
+      (bytes[1] << 8) |
+      (bytes[2] << 16) |
+      (bytes[3] << 24);
+
+    const expectedSize = 4 + count * HASH_SIZE;
+    if (bytes.length !== expectedSize) {
+      throw new Error(`Invalid size: expected ${expectedSize}, got ${bytes.length}`);
+    }
+
+    const sequence = new HashSequence();
+    for (let i = 0; i < count; i++) {
+      const start = 4 + i * HASH_SIZE;
+      const hash = bytes.slice(start, start + HASH_SIZE);
+      sequence._hashes.push(hash);
+    }
+
+    return sequence;
+  }
+
+  /**
+   * Create a HashSequence from an array of hashes.
+   * @param {Uint8Array[]} hashes - Array of 32-byte hashes
+   * @returns {HashSequence} New HashSequence instance
+   */
+  static from(hashes) {
+    return new HashSequence(hashes);
+  }
+
+  /**
+   * Create a HashSequence from hex strings.
+   * @param {string[]} hexStrings - Array of 64-character hex strings
+   * @returns {HashSequence} New HashSequence instance
+   */
+  static fromHex(hexStrings) {
+    const sequence = new HashSequence();
+    for (const hex of hexStrings) {
+      if (typeof hex !== 'string' || hex.length !== 64) {
+        throw new Error('Each hex string must be 64 characters');
+      }
+      const hash = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) {
+        hash[i] = parseInt(hex.substr(i * 2, 2), 16);
+      }
+      sequence._hashes.push(hash);
+    }
+    return sequence;
+  }
+
+  /**
+   * Export to JSON-serializable object.
+   * @returns {Object} JSON-serializable representation
+   */
+  toJSON() {
+    return {
+      hashes: this._hashes.map(h =>
+        Array.from(h).map(b => b.toString(16).padStart(2, '0')).join('')
+      )
+    };
+  }
+
+  /**
+   * Create from JSON object.
+   * @param {Object} json - Object with hashes array
+   * @returns {HashSequence} New HashSequence instance
+   */
+  static fromJSON(json) {
+    if (!json || !Array.isArray(json.hashes)) {
+      throw new Error('Invalid JSON: missing hashes array');
+    }
+    return HashSequence.fromHex(json.hashes);
+  }
+
+  /**
+   * Get hex string representation of a hash at index.
+   * @param {number} index - Index of hash
+   * @returns {string} 64-character hex string
+   */
+  getHashHex(index) {
+    const hash = this.getHash(index);
+    return Array.from(hash).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  /**
+   * Get hex string of the sequence hash.
+   * @returns {string} 64-character hex string
+   */
+  finalizeHex() {
+    const hash = this.finalize();
+    return Array.from(hash).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  /**
+   * Clear all hashes from the sequence.
+   * @returns {HashSequence} this (for chaining)
+   */
+  clear() {
+    this._hashes = [];
+    return this;
+  }
+
+  /**
+   * Remove hash at the specified index.
+   * @param {number} index - Index of hash to remove
+   * @returns {Uint8Array} The removed hash
+   */
+  removeAt(index) {
+    if (index < 0 || index >= this._hashes.length) {
+      throw new Error(`Index out of bounds: ${index}`);
+    }
+    const removed = this._hashes.splice(index, 1)[0];
+    return new Uint8Array(removed);
+  }
+
+  /**
+   * Insert a hash at the specified index.
+   * @param {number} index - Index to insert at
+   * @param {Uint8Array} hash - 32-byte hash to insert
+   * @returns {HashSequence} this (for chaining)
+   */
+  insertAt(index, hash) {
+    if (index < 0 || index > this._hashes.length) {
+      throw new Error(`Index out of bounds: ${index}`);
+    }
+    if (!(hash instanceof Uint8Array) || hash.length !== HASH_SIZE) {
+      throw new Error(`Hash must be ${HASH_SIZE} bytes`);
+    }
+    this._hashes.splice(index, 0, new Uint8Array(hash));
+    return this;
+  }
+
+  /**
+   * Create a slice of the sequence.
+   * @param {number} start - Start index (inclusive)
+   * @param {number} [end] - End index (exclusive), defaults to length
+   * @returns {HashSequence} New HashSequence with sliced hashes
+   */
+  slice(start, end) {
+    const sliced = this._hashes.slice(start, end);
+    return new HashSequence(sliced);
+  }
+
+  /**
+   * Concatenate with another sequence.
+   * @param {HashSequence} other - Sequence to concatenate
+   * @returns {HashSequence} New HashSequence with combined hashes
+   */
+  concat(other) {
+    if (!(other instanceof HashSequence)) {
+      throw new Error('Argument must be a HashSequence');
+    }
+    const combined = new HashSequence(this._hashes);
+    for (const hash of other._hashes) {
+      combined._hashes.push(new Uint8Array(hash));
+    }
+    return combined;
+  }
+
+  /**
+   * Check equality with another sequence.
+   * @param {HashSequence} other - Sequence to compare
+   * @returns {boolean} True if sequences are equal
+   */
+  equals(other) {
+    if (!(other instanceof HashSequence)) {
+      return false;
+    }
+    if (this._hashes.length !== other._hashes.length) {
+      return false;
+    }
+    for (let i = 0; i < this._hashes.length; i++) {
+      if (!constantTimeEqual(this._hashes[i], other._hashes[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
 // Exports
 module.exports = {
   // Core primitives
@@ -1083,6 +2243,25 @@ module.exports = {
   BaoEncoder,
   BaoDecoder,
 
+  // Iroh chunk group support
+  baoEncodeIroh,
+  baoDecodeIroh,
+  baoVerifyIroh,
+  chunkGroupCV,
+  countChunkGroups,
+  irohOutboardSize,
+
+  // Partial/Resumable downloads
+  PartialBao,
+  createBitfield,
+  setBit,
+  clearBit,
+  getBit,
+  countSetBits,
+
+  // Hash sequences (blob collections)
+  HashSequence,
+
   // Utilities
   countChunks,
   encodedSubtreeSize,
@@ -1098,5 +2277,7 @@ module.exports = {
   HEADER_SIZE,
   HASH_SIZE,
   PARENT_SIZE,
-  IV
+  IV,
+  IROH_CHUNK_GROUP_LOG,
+  IROH_CHUNK_GROUP_SIZE
 };

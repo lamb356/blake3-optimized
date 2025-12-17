@@ -1,2 +1,22 @@
+# Dependencies
 node_modules/
 package-lock.json
+
+# Build artifacts
+*.tgz
+test-install/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*

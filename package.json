@@ -1,24 +1,73 @@
 {
-  "name": "blake3-bounty",
+  "name": "blake3-bao",
   "version": "1.0.0",
-  "description": "A highly optimized pure JavaScript implementation of the [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) cryptographic hash function with embedded WASM SIMD support for maximum performance.",
-  "main": "benchmark.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "description": "Pure JavaScript BLAKE3 hash and Bao verified streaming implementation with Iroh compatibility",
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    },
+    "./blake3": {
+      "types": "./types/blake3.d.ts",
+      "import": "./blake3.mjs",
+      "require": "./blake3.js"
+    },
+    "./bao": {
+      "types": "./types/bao.d.ts",
+      "import": "./bao.mjs",
+      "require": "./bao.js"
+    }
   },
+  "browser": "./dist/blake3-bao.min.js",
+  "files": [
+    "index.js",
+    "index.mjs",
+    "blake3.js",
+    "blake3.mjs",
+    "bao.js",
+    "bao.mjs",
+    "dist/",
+    "types/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "webpack --config webpack.config.js",
+    "build:watch": "webpack --config webpack.config.js --watch",
+    "test": "node test.js && node test-keyed.js && node test-kdf.js && node test-xof.js && node test-streaming.js && node test-bao-vectors.js && node test-bao-primitives.js && node test-bao-encode.js && node test-bao-decode.js && node test-bao-slice.js && node test-bao-streaming.js && node test-bao-iroh.js && node test-bao-partial.js && node test-bao-sequence.js"
+  },
+  "keywords": [
+    "blake3",
+    "bao",
+    "hash",
+    "crypto",
+    "merkle",
+    "streaming",
+    "verified-streaming",
+    "iroh",
+    "content-addressing"
+  ],
+  "author": "lamb",
+  "license": "MIT",
+  "sideEffects": false,
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lamb356/blake3-optimized.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "bugs": {
     "url": "https://github.com/lamb356/blake3-optimized/issues"
   },
   "homepage": "https://github.com/lamb356/blake3-optimized#readme",
-  "dependencies": {
-    "wabt": "^1.0.39"
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "devDependencies": {
+    "terser-webpack-plugin": "^5.3.16",
+    "webpack": "^5.104.0",
+    "webpack-cli": "^6.0.1"
   }
 }

@@ -1,0 +1,25 @@
+# Tests
+test-*.js
+test-vectors.json
+
+# Development files
+*.bench.js
+benchmark.js
+benchmark-*.js
+.git*
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+
+# Misc
+*.log
+*.tmp

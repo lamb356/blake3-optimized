@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>blake3-bao Browser Test</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #eee; }
+    h1 { color: #7c3aed; }
+    pre { background: #16213e; padding: 15px; border-radius: 5px; overflow-x: auto; }
+    .pass { color: #10b981; }
+    .fail { color: #ef4444; }
+  </style>
+</head>
+<body>
+  <h1>blake3-bao Browser Test</h1>
+  <pre id="output">Loading...</pre>
+  <script src="dist/blake3-bao.min.js"></script>
+  <script>
+    const output = document.getElementById('output');
+    let tests = 0, passed = 0;
+
+    function log(msg) {
+      output.textContent += msg + '\n';
+    }
+
+    function test(name, fn) {
+      tests++;
+      try {
+        fn();
+        log('<span class="pass">PASS</span>: ' + name);
+        passed++;
+      } catch (e) {
+        log('<span class="fail">FAIL</span>: ' + name + ' - ' + e.message);
+      }
+    }
+
+    function assertEqual(actual, expected, msg) {
+      if (actual !== expected) {
+        throw new Error(msg + ': expected ' + expected + ', got ' + actual);
+      }
+    }
+
+    output.textContent = 'Running browser tests...\n\n';
+
+    try {
+      // Test BLAKE3 hashing
+      test('BLAKE3 hash', () => {
+        const hash = blake3Bao.blake3.hash('hello world');
+        const hex = blake3Bao.blake3.toHex(hash);
+        assertEqual(hex, 'd74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24', 'Hash mismatch');
+      });
+
+      // Test BLAKE3 hashHex
+      test('BLAKE3 hashHex', () => {
+        const hex = blake3Bao.blake3.hashHex('hello world');
+        assertEqual(hex, 'd74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24', 'Hash mismatch');
+      });
+
+      // Test BLAKE3 Hasher
+      test('BLAKE3 Hasher streaming', () => {
+        const hasher = blake3Bao.blake3.createHasher();
+        hasher.update('hello ');
+        hasher.update('world');
+        const hex = hasher.finalizeHex();
+        assertEqual(hex, 'd74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24', 'Hash mismatch');
+      });
+
+      // Test Bao encoding
+      test('Bao encode', () => {
+        const data = new Uint8Array(1024);
+        for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+        const { encoded, hash } = blake3Bao.bao.baoEncode(data);
+        assertEqual(encoded.length, 1032, 'Encoded size mismatch');
+        assertEqual(hash.length, 32, 'Hash size mismatch');
+      });
+
+      // Test Bao decode
+      test('Bao encode/decode round-trip', () => {
+        const data = new Uint8Array(2049);
+        for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+        const { encoded, hash } = blake3Bao.bao.baoEncode(data);
+        const decoded = blake3Bao.bao.baoDecode(encoded, hash);
+        assertEqual(decoded.length, data.length, 'Decoded size mismatch');
+        for (let i = 0; i < data.length; i++) {
+          if (decoded[i] !== data[i]) {
+            throw new Error('Data mismatch at index ' + i);
+          }
+        }
+      });
+
+      // Test Bao slicing
+      test('Bao slice', () => {
+        const data = new Uint8Array(4096);
+        for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+        const { encoded, hash } = blake3Bao.bao.baoEncode(data);
+        const slice = blake3Bao.bao.baoSlice(encoded, 1024, 1024);
+        const sliceData = blake3Bao.bao.baoDecodeSlice(slice, hash, 1024, 1024);
+        assertEqual(sliceData.length, 1024, 'Slice size mismatch');
+      });
+
+      // Test HashSequence
+      test('HashSequence', () => {
+        const seq = new blake3Bao.bao.HashSequence();
+        const hash1 = blake3Bao.blake3.hash('file1');
+        const hash2 = blake3Bao.blake3.hash('file2');
+        seq.addHash(hash1);
+        seq.addHash(hash2);
+        assertEqual(seq.length, 2, 'Sequence length mismatch');
+        assertEqual(seq.hasHash(hash1), true, 'Should have hash1');
+      });
+
+      // Test PartialBao
+      test('PartialBao', () => {
+        const data = new Uint8Array(32 * 1024);  // 32 KB = 2 chunk groups
+        for (let i = 0; i < data.length; i++) data[i] = i & 0xff;
+        const { hash } = blake3Bao.bao.baoEncodeIroh(data, true);
+        const partial = new blake3Bao.bao.PartialBao(hash, data.length);
+        assertEqual(partial.numGroups, 2, 'Should have 2 groups');
+        assertEqual(partial.isComplete(), false, 'Should not be complete');
+      });
+
+      // Test Iroh encoding
+      test('Bao Iroh encode', () => {
+        const data = new Uint8Array(64 * 1024);  // 64 KB
+        const { encoded, hash } = blake3Bao.bao.baoEncodeIroh(data, true);
+        // Iroh outboard for 64KB should be small (tree nodes only)
+        assertEqual(hash.length, 32, 'Hash size mismatch');
+        // 64KB = 4 chunk groups = 3 parent nodes = header + 3*64 bytes
+        assertEqual(encoded.length, 8 + 3 * 64, 'Outboard size mismatch');
+      });
+
+      log('\n========================================');
+      log('Results: ' + passed + '/' + tests + ' tests passed');
+
+      if (passed === tests) {
+        log('\n<span class="pass">All browser tests passed!</span>');
+      } else {
+        log('\n<span class="fail">Some tests failed.</span>');
+      }
+
+      // Re-render with HTML spans
+      output.innerHTML = output.textContent;
+
+    } catch (e) {
+      log('\nFATAL ERROR: ' + e.message);
+      console.error(e);
+      output.innerHTML = output.textContent;
+    }
+  </script>
+</body>
+</html>
