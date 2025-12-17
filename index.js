@@ -50,3 +50,14 @@ exports.HashSequence = bao.HashSequence;
 // Named sub-modules
 exports.blake3 = blake3;
 exports.bao = bao;
+
+// WASM-accelerated modules (optional)
+// These provide faster Bao operations for large files
+try {
+  exports.baoWasm = require('./bao-wasm.js');
+  exports.baoWasmZerocopy = require('./bao-wasm-zerocopy.js');
+} catch (e) {
+  // WASM modules are optional - may not be available in all environments
+  exports.baoWasm = null;
+  exports.baoWasmZerocopy = null;
+}

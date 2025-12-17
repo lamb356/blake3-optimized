@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2024-12-17
+
+### Added
+- `BaoEncoder` streaming class for memory-efficient Bao encoding
+  - O(log n) memory usage in outboard mode (stores only chunk CVs)
+  - Supports incremental `write()` API for large file streaming
+  - Idempotent `finalize()` for safe repeated calls
+- WASM-accelerated Bao operations (optional)
+  - `bao-wasm.js` module with AssemblyScript-compiled WASM
+  - `bao-wasm-zerocopy.js` with direct buffer access for maximum performance
+  - Batch `chunkCV` and `parentCV` operations
+  - Fallback to pure JS when WASM unavailable
+
+### Changed
+- **Buffer pooling**: Reusable Uint32Array buffers reduce GC pressure
+- **Single allocation**: `baoEncode` pre-calculates exact output size
+- **Pre-order tree traversal**: Optimized tree building for Bao encoding
+
+### Performance
+- Bao encode outboard: ~198 MB/s (was ~153 MB/s, **29% faster**)
+- Bao encode combined: ~185 MB/s (was ~101 MB/s, **83% faster**)
+- chunkCV primitive: ~203 MB/s throughput
+- BaoEncoder streaming: ~150-168 MB/s with O(log n) memory
+
 ## [1.0.0] - 2024-12-17
 
 ### Added

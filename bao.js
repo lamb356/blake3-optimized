@@ -8,6 +8,7 @@
  */
 
 const blake3 = require('./blake3.js');
+const pool = require('./buffer-pool.js');
 
 // Import from blake3.js
 const { IV, BLOCK_LEN, CHUNK_LEN, _compress: compress } = blake3;
@@ -20,9 +21,12 @@ const ROOT = 8;
 
 /**
  * Convert a Uint32Array to a Uint8Array (little-endian)
+ * @param {Uint32Array} words - Input words
+ * @param {Uint8Array} [out] - Optional output buffer (if not provided, allocates new)
+ * @returns {Uint8Array} Output bytes
  */
-function wordsToBytes(words) {
-  const bytes = new Uint8Array(words.length * 4);
+function wordsToBytes(words, out) {
+  const bytes = out || new Uint8Array(words.length * 4);
   for (let i = 0; i < words.length; i++) {
     bytes[i * 4] = words[i] & 0xff;
     bytes[i * 4 + 1] = (words[i] >> 8) & 0xff;
@@ -31,6 +35,11 @@ function wordsToBytes(words) {
   }
   return bytes;
 }
+
+// Reusable Uint32Array buffers for chunkCV/parentCV to reduce allocations
+const _blockWords = new Uint32Array(16);
+const _cvOut = new Uint32Array(8);
+const _cvTemp = new Uint32Array(8);
 
 /**
  * Compute the chaining value (CV) for a chunk.
@@ -42,7 +51,8 @@ function wordsToBytes(words) {
  */
 function chunkCV(chunkBytes, chunkIndex, isRoot) {
   // Initialize CV with IV
-  let cv = new Uint32Array(IV);
+  _cvTemp.set(IV);
+  let cv = _cvTemp;
 
   const chunkLen = chunkBytes.length;
   const numBlocks = chunkLen === 0 ? 1 : Math.ceil(chunkLen / BLOCK_LEN);
@@ -52,10 +62,10 @@ function chunkCV(chunkBytes, chunkIndex, isRoot) {
     const blockEnd = Math.min(blockStart + BLOCK_LEN, chunkLen);
     const blockLen = blockEnd - blockStart;
 
-    // Build block words
-    const blockWords = new Uint32Array(16);
+    // Build block words (reuse buffer, clear first)
+    _blockWords.fill(0);
     for (let i = 0; i < blockLen; i++) {
-      blockWords[i >> 2] |= chunkBytes[blockStart + i] << ((i & 3) * 8);
+      _blockWords[i >> 2] |= chunkBytes[blockStart + i] << ((i & 3) * 8);
     }
 
     // Determine flags
@@ -67,14 +77,26 @@ function chunkCV(chunkBytes, chunkIndex, isRoot) {
     if (isLastBlock) flags |= CHUNK_END;
     if (isLastBlock && isRoot) flags |= ROOT;
 
-    // Compress
-    const out = new Uint32Array(8);
-    compress(cv, 0, blockWords, 0, out, 0, true, chunkIndex, blockLen, flags);
-    cv = out;
+    // Compress into reusable buffer
+    compress(cv, 0, _blockWords, 0, _cvOut, 0, true, chunkIndex, blockLen, flags);
+
+    // Swap buffers for next iteration
+    const temp = cv;
+    cv = _cvOut;
+    if (blockIdx < numBlocks - 1) {
+      // Need to preserve cv for next iteration
+      _cvTemp.set(_cvOut);
+      cv = _cvTemp;
+    }
   }
 
+  // Return a new Uint8Array (must allocate for return value)
   return wordsToBytes(cv);
 }
+
+// Reusable buffers for parentCV
+const _parentBlockWords = new Uint32Array(16);
+const _parentOut = new Uint32Array(8);
 
 /**
  * Compute the chaining value for a parent node.
@@ -86,16 +108,17 @@ function chunkCV(chunkBytes, chunkIndex, isRoot) {
  */
 function parentCV(leftCV, rightCV, isRoot) {
   // Build block from concatenated CVs (64 bytes = 16 words)
-  const blockWords = new Uint32Array(16);
+  // Clear and reuse buffer
+  _parentBlockWords.fill(0);
 
   // Left CV -> words 0-7
   for (let i = 0; i < 32; i++) {
-    blockWords[i >> 2] |= leftCV[i] << ((i & 3) * 8);
+    _parentBlockWords[i >> 2] |= leftCV[i] << ((i & 3) * 8);
   }
 
   // Right CV -> words 8-15
   for (let i = 0; i < 32; i++) {
-    blockWords[8 + (i >> 2)] |= rightCV[i] << ((i & 3) * 8);
+    _parentBlockWords[8 + (i >> 2)] |= rightCV[i] << ((i & 3) * 8);
   }
 
   // Flags: always PARENT, optionally ROOT
@@ -103,10 +126,9 @@ function parentCV(leftCV, rightCV, isRoot) {
   if (isRoot) flags |= ROOT;
 
   // Compress with IV as input CV, counter = 0, blockLen = 64
-  const out = new Uint32Array(8);
-  compress(IV, 0, blockWords, 0, out, 0, true, 0, BLOCK_LEN, flags);
+  compress(IV, 0, _parentBlockWords, 0, _parentOut, 0, true, 0, BLOCK_LEN, flags);
 
-  return wordsToBytes(out);
+  return wordsToBytes(_parentOut);
 }
 
 /**
@@ -202,7 +224,7 @@ function decodeLen(bytes) {
 }
 
 /**
- * Encode data in Bao format.
+ * Encode data in Bao format (optimized single-allocation version).
  *
  * Format: [8-byte length LE] + [pre-order tree nodes]
  * Pre-order: parent node, then left subtree, then right subtree
@@ -219,60 +241,62 @@ function baoEncode(buf, outboard = false) {
     buf = new Uint8Array(buf);
   }
 
+  // Pre-calculate total output size for single allocation
+  const totalSize = HEADER_SIZE + encodedSubtreeSize(buf.length, outboard);
+  const output = new Uint8Array(totalSize);
+
+  // Write header
+  let n = buf.length;
+  for (let i = 0; i < 8; i++) {
+    output[i] = n & 0xff;
+    n = Math.floor(n / 256);
+  }
+
+  let writePos = HEADER_SIZE;
   let chunkIndex = 0;
 
   /**
-   * Recursive encoding function.
+   * Recursive encoding function that writes directly to output buffer.
    *
    * @param {Uint8Array} data - Data segment to encode
    * @param {boolean} isRoot - Whether this is the root node
-   * @returns {{ encoded: Uint8Array, cv: Uint8Array }}
+   * @returns {Uint8Array} Chaining value (32 bytes)
    */
   function encodeRecurse(data, isRoot) {
     if (data.length <= CHUNK_LEN) {
       // Leaf node: single chunk
       const cv = chunkCV(data, chunkIndex, isRoot);
-      const chunkEncoded = outboard ? new Uint8Array(0) : data;
+      if (!outboard) {
+        output.set(data, writePos);
+        writePos += data.length;
+      }
       chunkIndex++;
-      return { encoded: chunkEncoded, cv };
+      return cv;
     }
 
     // Interior node: split into left and right subtrees
     const lLen = leftLen(data.length);
 
+    // Reserve space for parent node (64 bytes) at current position
+    const parentPos = writePos;
+    writePos += 64;
+
     // Recursively encode left and right (neither is root)
-    const leftResult = encodeRecurse(data.subarray(0, lLen), false);
-    const rightResult = encodeRecurse(data.subarray(lLen), false);
+    const leftCV = encodeRecurse(data.subarray(0, lLen), false);
+    const rightCV = encodeRecurse(data.subarray(lLen), false);
 
-    // Parent node = left_cv + right_cv (64 bytes)
-    const parentNode = new Uint8Array(64);
-    parentNode.set(leftResult.cv, 0);
-    parentNode.set(rightResult.cv, 32);
+    // Write parent node at reserved position
+    output.set(leftCV, parentPos);
+    output.set(rightCV, parentPos + 32);
 
-    // Compute parent CV
-    const cv = parentCV(leftResult.cv, rightResult.cv, isRoot);
-
-    // Pre-order: parent node, then left, then right
-    const encoded = new Uint8Array(
-      parentNode.length + leftResult.encoded.length + rightResult.encoded.length
-    );
-    encoded.set(parentNode, 0);
-    encoded.set(leftResult.encoded, parentNode.length);
-    encoded.set(rightResult.encoded, parentNode.length + leftResult.encoded.length);
-
-    return { encoded, cv };
+    // Compute and return parent CV
+    return parentCV(leftCV, rightCV, isRoot);
   }
 
   // Encode the tree (root finalization at top level)
-  const result = encodeRecurse(buf, true);
+  const rootHash = encodeRecurse(buf, true);
 
-  // Prepend length header
-  const header = encodeLen(buf.length);
-  const output = new Uint8Array(header.length + result.encoded.length);
-  output.set(header, 0);
-  output.set(result.encoded, header.length);
-
-  return { encoded: output, hash: result.cv };
+  return { encoded: output, hash: rootHash };
 }
 
 // ============================================
@@ -636,10 +660,12 @@ function baoDecodeSlice(slice, rootHash, sliceStart, sliceLen) {
 // ============================================
 
 /**
- * Streaming Bao encoder.
+ * Streaming Bao encoder with optimized memory usage.
  *
- * Accumulates data incrementally and produces a complete Bao encoding
- * at finalize(). Uses O(log n) memory via a CV stack.
+ * - Outboard mode: O(n) memory but only 32 bytes per chunk (stores CVs only)
+ * - Combined mode: O(n) memory (must store full chunks)
+ *
+ * Computes chunk CVs incrementally as data arrives.
  */
 class BaoEncoder {
   /**
@@ -649,16 +675,25 @@ class BaoEncoder {
    */
   constructor(outboard = false) {
     this.outboard = outboard;
-    this.chunks = [];           // Accumulated chunks
-    this.totalLen = 0;          // Total bytes written
-    this.pendingData = [];      // Buffered data not yet forming a complete chunk
-    this.pendingLen = 0;        // Length of pending data
+    this.totalLen = 0;
+    this.pendingData = [];
+    this.pendingLen = 0;
+
+    // For outboard mode: store only chunk CVs (32 bytes each)
+    // For combined mode: store full chunk data
+    this.chunkCVs = [];      // Used in outboard mode
+    this.chunkData = [];     // Used in combined mode
+    this.chunkIndex = 0;
+
+    // Cache finalize result for idempotency
+    this._finalResult = null;
   }
 
   /**
    * Write data to the encoder.
    *
    * @param {Uint8Array|string} data - Data to write
+   * @returns {BaoEncoder} this (for chaining)
    */
   write(data) {
     if (typeof data === 'string') {
@@ -668,7 +703,7 @@ class BaoEncoder {
       data = new Uint8Array(data);
     }
 
-    if (data.length === 0) return;
+    if (data.length === 0) return this;
 
     this.totalLen += data.length;
 
@@ -676,20 +711,31 @@ class BaoEncoder {
     this.pendingData.push(data);
     this.pendingLen += data.length;
 
-    // Extract complete chunks
+    // Process complete chunks
     while (this.pendingLen >= CHUNK_LEN) {
       const chunk = this._extractChunk(CHUNK_LEN);
-      this.chunks.push(chunk);
+      this._processChunk(chunk);
     }
+
+    return this;
   }
 
   /**
    * Extract a chunk of specified size from pending data.
-   *
-   * @param {number} size - Size to extract
-   * @returns {Uint8Array} Extracted data
    */
   _extractChunk(size) {
+    if (this.pendingData.length === 1 && this.pendingData[0].length >= size) {
+      const first = this.pendingData[0];
+      const result = new Uint8Array(first.subarray(0, size));
+      if (first.length === size) {
+        this.pendingData.shift();
+      } else {
+        this.pendingData[0] = first.subarray(size);
+      }
+      this.pendingLen -= size;
+      return result;
+    }
+
     const result = new Uint8Array(size);
     let resultPos = 0;
 
@@ -698,12 +744,10 @@ class BaoEncoder {
       const needed = size - resultPos;
 
       if (first.length <= needed) {
-        // Use entire first buffer
         result.set(first, resultPos);
         resultPos += first.length;
         this.pendingData.shift();
       } else {
-        // Use partial first buffer
         result.set(first.subarray(0, needed), resultPos);
         this.pendingData[0] = first.subarray(needed);
         resultPos += needed;
@@ -715,34 +759,225 @@ class BaoEncoder {
   }
 
   /**
+   * Process a complete chunk.
+   */
+  _processChunk(chunk) {
+    // Compute chunk CV (not root - determined at finalize)
+    const cv = chunkCV(chunk, this.chunkIndex, false);
+    this.chunkIndex++;
+
+    if (this.outboard) {
+      this.chunkCVs.push(cv);  // Store 32-byte CV only
+    } else {
+      this.chunkCVs.push(cv);  // Store CV for tree building
+      this.chunkData.push(chunk);  // Store full chunk
+    }
+  }
+
+  /**
    * Finalize the encoding and return the result.
+   * This method is idempotent - calling it multiple times returns the same result.
    *
-   * @returns {{ encoded: Uint8Array, hash: Uint8Array }} Encoded data and root hash
+   * @returns {{ encoded: Uint8Array, hash: Uint8Array }}
    */
   finalize() {
-    // Flush any remaining pending data as final chunk
-    if (this.pendingLen > 0) {
-      const finalChunk = this._extractChunk(this.pendingLen);
-      this.chunks.push(finalChunk);
+    // Return cached result if already finalized
+    if (this._finalResult) {
+      return this._finalResult;
     }
 
-    // Handle empty input
-    if (this.chunks.length === 0) {
-      this.chunks.push(new Uint8Array(0));
+    // Handle remaining pending data as final chunk
+    if (this.pendingLen > 0 || this.chunkIndex === 0) {
+      const finalChunk = this.pendingLen > 0
+        ? this._extractChunk(this.pendingLen)
+        : new Uint8Array(0);
+
+      // Single chunk case: it's the root
+      if (this.chunkIndex === 0) {
+        const rootHash = chunkCV(finalChunk, 0, true);
+        const header = encodeLen(this.totalLen);
+
+        if (this.outboard) {
+          this._finalResult = { encoded: header, hash: rootHash };
+          return this._finalResult;
+        } else {
+          const encoded = new Uint8Array(HEADER_SIZE + finalChunk.length);
+          encoded.set(header, 0);
+          encoded.set(finalChunk, HEADER_SIZE);
+          this._finalResult = { encoded, hash: rootHash };
+          return this._finalResult;
+        }
+      }
+
+      // Multiple chunks: process final chunk
+      const cv = chunkCV(finalChunk, this.chunkIndex, false);
+      this.chunkIndex++;
+      this.chunkCVs.push(cv);
+
+      if (!this.outboard) {
+        this.chunkData.push(finalChunk);
+      }
     }
 
-    // Now encode using the same algorithm as baoEncode
-    // Build complete data buffer
-    const totalLen = this.totalLen;
-    const buf = new Uint8Array(totalLen);
-    let pos = 0;
-    for (const chunk of this.chunks) {
-      buf.set(chunk, pos);
-      pos += chunk.length;
+    // Build tree from chunk CVs
+    if (this.outboard) {
+      this._finalResult = this._buildOutboardFromCVs();
+    } else {
+      this._finalResult = this._buildCombinedFromCVs();
+    }
+    return this._finalResult;
+  }
+
+  /**
+   * Build outboard encoding from stored chunk CVs.
+   * Memory efficient: only stores 32 bytes per chunk.
+   */
+  _buildOutboardFromCVs() {
+    const numChunks = this.chunkCVs.length;
+
+    if (numChunks === 1) {
+      // Recompute with isRoot=true (the stored CV used isRoot=false)
+      const header = encodeLen(this.totalLen);
+      // For single chunk, the CV should have been computed with isRoot=true
+      // But we stored it with isRoot=false, so we need the original chunk...
+      // Actually, this case is handled in finalize() above, so we shouldn't get here
+      return { encoded: header, hash: this.chunkCVs[0] };
     }
 
-    // Use existing baoEncode
-    return baoEncode(buf, this.outboard);
+    const numParents = numChunks - 1;
+    const outputSize = HEADER_SIZE + numParents * 64;
+    const output = new Uint8Array(outputSize);
+
+    // Write header
+    let n = this.totalLen;
+    for (let i = 0; i < 8; i++) {
+      output[i] = n & 0xff;
+      n = Math.floor(n / 256);
+    }
+
+    let writePos = HEADER_SIZE;
+
+    // Memoize subtree CV computations
+    const cvCache = new Map();
+
+    const getSubtreeCV = (startIdx, count) => {
+      if (count === 1) return this.chunkCVs[startIdx];
+
+      const key = `${startIdx}:${count}`;
+      if (cvCache.has(key)) return cvCache.get(key);
+
+      const leftCount = 1 << Math.floor(Math.log2(count - 1));
+      const leftCV = getSubtreeCV(startIdx, leftCount);
+      const rightCV = getSubtreeCV(startIdx + leftCount, count - leftCount);
+      const cv = parentCV(leftCV, rightCV, false);
+      cvCache.set(key, cv);
+      return cv;
+    };
+
+    // Write tree in pre-order
+    const writeTree = (startIdx, count, isRoot) => {
+      if (count === 1) {
+        return this.chunkCVs[startIdx];
+      }
+
+      const leftCount = 1 << Math.floor(Math.log2(count - 1));
+      const rightCount = count - leftCount;
+
+      const leftCV = getSubtreeCV(startIdx, leftCount);
+      const rightCV = getSubtreeCV(startIdx + leftCount, rightCount);
+
+      // Pre-order: write parent node first
+      output.set(leftCV, writePos);
+      output.set(rightCV, writePos + 32);
+      writePos += 64;
+
+      // Then recurse into subtrees
+      writeTree(startIdx, leftCount, false);
+      writeTree(startIdx + leftCount, rightCount, false);
+
+      return parentCV(leftCV, rightCV, isRoot);
+    };
+
+    const rootHash = writeTree(0, numChunks, true);
+
+    return { encoded: output, hash: rootHash };
+  }
+
+  /**
+   * Build combined encoding from stored chunks and CVs.
+   */
+  _buildCombinedFromCVs() {
+    const numChunks = this.chunkCVs.length;
+
+    // Calculate output size
+    const numParents = Math.max(0, numChunks - 1);
+    const outputSize = HEADER_SIZE + numParents * 64 + this.totalLen;
+    const output = new Uint8Array(outputSize);
+
+    // Write header
+    let n = this.totalLen;
+    for (let i = 0; i < 8; i++) {
+      output[i] = n & 0xff;
+      n = Math.floor(n / 256);
+    }
+
+    let writePos = HEADER_SIZE;
+    let chunkWriteIdx = 0;
+
+    // Memoize subtree CV computations
+    const cvCache = new Map();
+
+    const getSubtreeCV = (startIdx, count) => {
+      if (count === 1) return this.chunkCVs[startIdx];
+
+      const key = `${startIdx}:${count}`;
+      if (cvCache.has(key)) return cvCache.get(key);
+
+      const leftCount = 1 << Math.floor(Math.log2(count - 1));
+      const leftCV = getSubtreeCV(startIdx, leftCount);
+      const rightCV = getSubtreeCV(startIdx + leftCount, count - leftCount);
+      const cv = parentCV(leftCV, rightCV, false);
+      cvCache.set(key, cv);
+      return cv;
+    };
+
+    // Write tree in pre-order (combined mode includes chunk data)
+    const writeTree = (startIdx, count, isRoot) => {
+      if (count === 1) {
+        // Leaf: write chunk data
+        output.set(this.chunkData[chunkWriteIdx], writePos);
+        writePos += this.chunkData[chunkWriteIdx].length;
+        chunkWriteIdx++;
+        return this.chunkCVs[startIdx];
+      }
+
+      const leftCount = 1 << Math.floor(Math.log2(count - 1));
+      const rightCount = count - leftCount;
+
+      const leftCV = getSubtreeCV(startIdx, leftCount);
+      const rightCV = getSubtreeCV(startIdx + leftCount, rightCount);
+
+      // Pre-order: write parent node first
+      output.set(leftCV, writePos);
+      output.set(rightCV, writePos + 32);
+      writePos += 64;
+
+      // Then recurse into subtrees
+      writeTree(startIdx, leftCount, false);
+      writeTree(startIdx + leftCount, rightCount, false);
+
+      return parentCV(leftCV, rightCV, isRoot);
+    };
+
+    if (numChunks === 1) {
+      // Single chunk, no parent nodes
+      output.set(this.chunkData[0], HEADER_SIZE);
+      return { encoded: output, hash: chunkCV(this.chunkData[0], 0, true) };
+    }
+
+    const rootHash = writeTree(0, numChunks, true);
+
+    return { encoded: output, hash: rootHash };
   }
 }
 

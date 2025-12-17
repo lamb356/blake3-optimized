@@ -1,6 +1,6 @@
 {
   "name": "blake3-bao",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Pure JavaScript BLAKE3 hash and Bao verified streaming implementation with Iroh compatibility",
   "main": "index.js",
   "module": "index.mjs",
@@ -30,6 +30,9 @@
     "blake3.mjs",
     "bao.js",
     "bao.mjs",
+    "bao-wasm.js",
+    "bao-wasm-zerocopy.js",
+    "build/release.wasm",
     "dist/",
     "types/",
     "README.md",
@@ -38,7 +41,11 @@
   "scripts": {
     "build": "webpack --config webpack.config.js",
     "build:watch": "webpack --config webpack.config.js --watch",
-    "test": "node test.js && node test-keyed.js && node test-kdf.js && node test-xof.js && node test-streaming.js && node test-bao-vectors.js && node test-bao-primitives.js && node test-bao-encode.js && node test-bao-decode.js && node test-bao-slice.js && node test-bao-streaming.js && node test-bao-iroh.js && node test-bao-partial.js && node test-bao-sequence.js"
+    "test": "node test.js && node test-keyed.js && node test-kdf.js && node test-xof.js && node test-streaming.js && node test-bao-vectors.js && node test-bao-primitives.js && node test-bao-encode.js && node test-bao-decode.js && node test-bao-slice.js && node test-bao-streaming.js && node test-bao-iroh.js && node test-bao-partial.js && node test-bao-sequence.js",
+    "asbuild:debug": "asc assembly/index.ts --target debug",
+    "asbuild:release": "asc assembly/index.ts --target release",
+    "asbuild": "npm run asbuild:debug && npm run asbuild:release",
+    "start": "npx serve ."
   },
   "keywords": [
     "blake3",
@@ -66,6 +73,7 @@
     "node": ">=14.0.0"
   },
   "devDependencies": {
+    "assemblyscript": "^0.28.9",
     "terser-webpack-plugin": "^5.3.16",
     "webpack": "^5.104.0",
     "webpack-cli": "^6.0.1"

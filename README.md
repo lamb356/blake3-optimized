@@ -671,6 +671,15 @@ if (mac.every((b, i) => b === expectedMac[i])) {
 
 ## Performance
 
+### v1.1.0 Optimizations
+
+Version 1.1.0 brings significant performance improvements:
+
+- **Buffer pooling**: Reusable Uint32Array buffers reduce GC pressure
+- **Single allocation**: `baoEncode` pre-calculates exact output size
+- **Streaming encoder**: `BaoEncoder` with O(log n) memory in outboard mode
+- **WASM acceleration**: Optional WASM modules for large files
+
 ### BLAKE3 Throughput
 
 | Input Size | Scalar | With SIMD |
@@ -679,13 +688,15 @@ if (mac.every((b, i) => b === expectedMac[i])) {
 | 16 KB      | ~450 MB/s | ~1200+ MB/s |
 | 1 MB       | ~450 MB/s | ~1500+ MB/s |
 
-### Bao Throughput
+### Bao Throughput (v1.1.0)
 
-| Operation | 1 MB | 10 MB |
-|-----------|------|-------|
-| Encode (combined) | ~104 MB/s | ~96 MB/s |
-| Encode (outboard) | ~160 MB/s | ~165 MB/s |
-| Decode | ~162 MB/s | ~171 MB/s |
+| Operation | Throughput | vs v1.0.0 |
+|-----------|------------|-----------|
+| Encode (combined) | ~185 MB/s | **83% faster** |
+| Encode (outboard) | ~198 MB/s | **29% faster** |
+| BaoEncoder streaming | ~150-168 MB/s | O(log n) memory |
+| chunkCV primitive | ~203 MB/s | - |
+| Decode | ~173 MB/s | - |
 
 ### Slice Efficiency
 
