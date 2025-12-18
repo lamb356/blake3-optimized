@@ -1,4 +1,6 @@
-let wasm;
+
+let imports = {};
+imports['__wbindgen_placeholder__'] = module.exports;
 
 function getStringFromWasm0(ptr, len) {
     ptr = ptr >>> 0;
@@ -15,15 +17,7 @@ function getUint8ArrayMemory0() {
 
 let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
 cachedTextDecoder.decode();
-const MAX_SAFARI_DECODE_BYTES = 2146435072;
-let numBytesDecoded = 0;
 function decodeText(ptr, len) {
-    numBytesDecoded += len;
-    if (numBytesDecoded >= MAX_SAFARI_DECODE_BYTES) {
-        cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
-        cachedTextDecoder.decode();
-        numBytesDecoded = len;
-    }
     return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
 }
 
@@ -34,9 +28,10 @@ function decodeText(ptr, len) {
  * @param {number} num_chunks
  * @param {bigint} start_index
  */
-export function batch_chunk_cvs(num_chunks, start_index) {
+function batch_chunk_cvs(num_chunks, start_index) {
     wasm.batch_chunk_cvs(num_chunks, start_index);
 }
+exports.batch_chunk_cvs = batch_chunk_cvs;
 
 /**
  * Batch compute parent CVs
@@ -46,9 +41,24 @@ export function batch_chunk_cvs(num_chunks, start_index) {
  * @param {number} num_pairs
  * @param {number} root_index
  */
-export function batch_parent_cvs(num_pairs, root_index) {
+function batch_parent_cvs(num_pairs, root_index) {
     wasm.batch_parent_cvs(num_pairs, root_index);
 }
+exports.batch_parent_cvs = batch_parent_cvs;
+
+/**
+ * Build entire Merkle tree in a single pass
+ * Reads num_leaves * 32 bytes (leaf CVs) from INPUT_BUFFER
+ * Writes 32-byte root CV to OUTPUT_BUFFER
+ * Returns bytes written (32) or 0 on error
+ * @param {number} num_leaves
+ * @returns {number}
+ */
+function build_tree_single_pass(num_leaves) {
+    const ret = wasm.build_tree_single_pass(num_leaves);
+    return ret >>> 0;
+}
+exports.build_tree_single_pass = build_tree_single_pass;
 
 /**
  * Compute chunk CV - main export
@@ -57,51 +67,56 @@ export function batch_parent_cvs(num_pairs, root_index) {
  * @param {bigint} chunk_index
  * @param {boolean} is_root
  */
-export function chunk_cv(chunk_len, chunk_index, is_root) {
+function chunk_cv(chunk_len, chunk_index, is_root) {
     wasm.chunk_cv(chunk_len, chunk_index, is_root);
 }
+exports.chunk_cv = chunk_cv;
 
 /**
  * Get pointer to input buffer for direct memory access from JS
  * @returns {number}
  */
-export function get_input_ptr() {
+function get_input_ptr() {
     const ret = wasm.get_input_ptr();
     return ret >>> 0;
 }
+exports.get_input_ptr = get_input_ptr;
 
 /**
  * Get input buffer size
  * @returns {number}
  */
-export function get_input_size() {
+function get_input_size() {
     const ret = wasm.get_input_size();
     return ret >>> 0;
 }
+exports.get_input_size = get_input_size;
 
 /**
  * Get pointer to output buffer for direct memory access from JS
  * @returns {number}
  */
-export function get_output_ptr() {
+function get_output_ptr() {
     const ret = wasm.get_output_ptr();
     return ret >>> 0;
 }
+exports.get_output_ptr = get_output_ptr;
 
 /**
  * Get output buffer size
  * @returns {number}
  */
-export function get_output_size() {
+function get_output_size() {
     const ret = wasm.get_input_size();
     return ret >>> 0;
 }
+exports.get_output_size = get_output_size;
 
 /**
  * Get SIMD status info
  * @returns {string}
  */
-export function get_simd_info() {
+function get_simd_info() {
     let deferred1_0;
     let deferred1_1;
     try {
@@ -113,6 +128,7 @@ export function get_simd_info() {
         wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
     }
 }
+exports.get_simd_info = get_simd_info;
 
 /**
  * Compute parent CV from two child CVs
@@ -120,113 +136,24 @@ export function get_simd_info() {
  * Writes result to OUTPUT_BUFFER[0..32]
  * @param {boolean} is_root
  */
-export function parent_cv(is_root) {
+function parent_cv(is_root) {
     wasm.parent_cv(is_root);
 }
+exports.parent_cv = parent_cv;
 
-const EXPECTED_RESPONSE_TYPES = new Set(['basic', 'cors', 'default']);
+exports.__wbindgen_init_externref_table = function() {
+    const table = wasm.__wbindgen_externrefs;
+    const offset = table.grow(4);
+    table.set(0, undefined);
+    table.set(offset + 0, undefined);
+    table.set(offset + 1, null);
+    table.set(offset + 2, true);
+    table.set(offset + 3, false);
+};
 
-async function __wbg_load(module, imports) {
-    if (typeof Response === 'function' && module instanceof Response) {
-        if (typeof WebAssembly.instantiateStreaming === 'function') {
-            try {
-                return await WebAssembly.instantiateStreaming(module, imports);
-            } catch (e) {
-                const validResponse = module.ok && EXPECTED_RESPONSE_TYPES.has(module.type);
+const wasmPath = `${__dirname}/bao_wasm_bg.wasm`;
+const wasmBytes = require('fs').readFileSync(wasmPath);
+const wasmModule = new WebAssembly.Module(wasmBytes);
+const wasm = exports.__wasm = new WebAssembly.Instance(wasmModule, imports).exports;
 
-                if (validResponse && module.headers.get('Content-Type') !== 'application/wasm') {
-                    console.warn("`WebAssembly.instantiateStreaming` failed because your server does not serve Wasm with `application/wasm` MIME type. Falling back to `WebAssembly.instantiate` which is slower. Original error:\n", e);
-
-                } else {
-                    throw e;
-                }
-            }
-        }
-
-        const bytes = await module.arrayBuffer();
-        return await WebAssembly.instantiate(bytes, imports);
-    } else {
-        const instance = await WebAssembly.instantiate(module, imports);
-
-        if (instance instanceof WebAssembly.Instance) {
-            return { instance, module };
-        } else {
-            return instance;
-        }
-    }
-}
-
-function __wbg_get_imports() {
-    const imports = {};
-    imports.wbg = {};
-    imports.wbg.__wbindgen_init_externref_table = function() {
-        const table = wasm.__wbindgen_externrefs;
-        const offset = table.grow(4);
-        table.set(0, undefined);
-        table.set(offset + 0, undefined);
-        table.set(offset + 1, null);
-        table.set(offset + 2, true);
-        table.set(offset + 3, false);
-    };
-
-    return imports;
-}
-
-function __wbg_finalize_init(instance, module) {
-    wasm = instance.exports;
-    __wbg_init.__wbindgen_wasm_module = module;
-    cachedUint8ArrayMemory0 = null;
-
-
-    wasm.__wbindgen_start();
-    return wasm;
-}
-
-function initSync(module) {
-    if (wasm !== undefined) return wasm;
-
-
-    if (typeof module !== 'undefined') {
-        if (Object.getPrototypeOf(module) === Object.prototype) {
-            ({module} = module)
-        } else {
-            console.warn('using deprecated parameters for `initSync()`; pass a single object instead')
-        }
-    }
-
-    const imports = __wbg_get_imports();
-    if (!(module instanceof WebAssembly.Module)) {
-        module = new WebAssembly.Module(module);
-    }
-    const instance = new WebAssembly.Instance(module, imports);
-    return __wbg_finalize_init(instance, module);
-}
-
-async function __wbg_init(module_or_path) {
-    if (wasm !== undefined) return wasm;
-
-
-    if (typeof module_or_path !== 'undefined') {
-        if (Object.getPrototypeOf(module_or_path) === Object.prototype) {
-            ({module_or_path} = module_or_path)
-        } else {
-            console.warn('using deprecated parameters for the initialization function; pass a single object instead')
-        }
-    }
-
-    if (typeof module_or_path === 'undefined') {
-        module_or_path = new URL('bao_wasm_bg.wasm', import.meta.url);
-    }
-    const imports = __wbg_get_imports();
-
-    if (typeof module_or_path === 'string' || (typeof Request === 'function' && module_or_path instanceof Request) || (typeof URL === 'function' && module_or_path instanceof URL)) {
-        module_or_path = fetch(module_or_path);
-    }
-
-    const { instance, module } = await __wbg_load(await module_or_path, imports);
-
-    return __wbg_finalize_init(instance, module);
-}
-
-export { initSync };
-export default __wbg_init;
+wasm.__wbindgen_start();

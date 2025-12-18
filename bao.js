@@ -42,6 +42,45 @@ const _cvOut = new Uint32Array(8);
 const _cvTemp = new Uint32Array(8);
 
 /**
+ * Fast byte-to-word conversion using DataView for aligned reads.
+ * @param {Uint8Array} chunkBytes - Source bytes
+ * @param {number} blockStart - Start offset in source
+ * @param {number} blockLen - Number of bytes to load
+ * @param {Uint32Array} blockWords - Destination words (must be cleared)
+ */
+function loadBlockFast(chunkBytes, blockStart, blockLen, blockWords) {
+  // Clear the block words first
+  blockWords.fill(0);
+
+  // Handle empty block
+  if (blockLen === 0) return;
+
+  // Use DataView for efficient 32-bit reads (little-endian)
+  const alignedLen = blockLen & ~3; // Round down to 4-byte boundary
+
+  if (alignedLen > 0 && chunkBytes.buffer !== undefined) {
+    // Has underlying ArrayBuffer - use DataView for aligned portion
+    const view = new DataView(chunkBytes.buffer, chunkBytes.byteOffset + blockStart, alignedLen);
+    for (let i = 0; i < alignedLen; i += 4) {
+      blockWords[i >> 2] = view.getUint32(i, true); // little-endian
+    }
+  } else if (alignedLen > 0) {
+    // Fallback for non-TypedArray
+    for (let i = 0; i < alignedLen; i += 4) {
+      blockWords[i >> 2] = chunkBytes[blockStart + i] |
+                          (chunkBytes[blockStart + i + 1] << 8) |
+                          (chunkBytes[blockStart + i + 2] << 16) |
+                          (chunkBytes[blockStart + i + 3] << 24);
+    }
+  }
+
+  // Handle remaining 1-3 bytes
+  for (let i = alignedLen; i < blockLen; i++) {
+    blockWords[i >> 2] |= chunkBytes[blockStart + i] << ((i & 3) * 8);
+  }
+}
+
+/**
  * Compute the chaining value (CV) for a chunk.
  *
  * @param {Uint8Array} chunkBytes - The chunk data (0 to 1024 bytes)
@@ -62,11 +101,8 @@ function chunkCV(chunkBytes, chunkIndex, isRoot) {
     const blockEnd = Math.min(blockStart + BLOCK_LEN, chunkLen);
     const blockLen = blockEnd - blockStart;
 
-    // Build block words (reuse buffer, clear first)
-    _blockWords.fill(0);
-    for (let i = 0; i < blockLen; i++) {
-      _blockWords[i >> 2] |= chunkBytes[blockStart + i] << ((i & 3) * 8);
-    }
+    // Build block words using fast DataView approach
+    loadBlockFast(chunkBytes, blockStart, blockLen, _blockWords);
 
     // Determine flags
     let flags = 0;

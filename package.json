@@ -35,6 +35,7 @@
     "bao-rust-wasm.js",
     "bao-rust-worker.js",
     "bao-rust-parallel.js",
+    "worker-pool.js",
     "rust-bao/pkg/",
     "build/release.wasm",
     "dist/",

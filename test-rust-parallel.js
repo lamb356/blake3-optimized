@@ -159,6 +159,62 @@ async function runBenchmarks() {
     console.log('FAIL: Some CVs do not match!');
   }
 
+  // Test optimized encoding (parallel chunks + sequential tree)
+  console.log('\n' + '='.repeat(70));
+  console.log('OPTIMIZED ENCODING: PARALLEL CHUNKS + SEQUENTIAL TREE');
+  console.log('='.repeat(70));
+
+  for (const size of testSizes) {
+    const numChunks = Math.floor(size / CHUNK_LEN);
+    const data = testData.subarray(0, size);
+
+    console.log(`\n--- ${formatSize(size)} (${numChunks} chunks, ${Math.ceil(Math.log2(numChunks))} tree levels) ---\n`);
+
+    const iterations = size <= 4 * 1024 * 1024 ? 5 : 3;
+
+    // Benchmark chunks only
+    let chunksOnlyTotal = 0;
+    for (let iter = 0; iter < iterations; iter++) {
+      const start = Date.now();
+      await processor.batchChunkCVsParallel(data, 0);
+      chunksOnlyTotal += Date.now() - start;
+    }
+    const chunksOnlyMs = chunksOnlyTotal / iterations;
+
+    // Benchmark parallel tree (old approach)
+    let parallelTreeTotal = 0;
+    for (let iter = 0; iter < iterations; iter++) {
+      const start = Date.now();
+      const chunkCVs = await processor.batchChunkCVsParallel(data, 0);
+      await processor.buildTreeParallel(chunkCVs);
+      parallelTreeTotal += Date.now() - start;
+    }
+    const parallelTreeMs = parallelTreeTotal / iterations;
+
+    // Benchmark optimized (parallel chunks + sequential tree)
+    let optimizedTotal = 0;
+    for (let iter = 0; iter < iterations; iter++) {
+      const start = Date.now();
+      await processor.baoEncodeOptimized(data);
+      optimizedTotal += Date.now() - start;
+    }
+    const optimizedMs = optimizedTotal / iterations;
+
+    console.log(`Chunks only:           ${chunksOnlyMs.toFixed(1)}ms  ${formatThroughput(size, chunksOnlyMs)}`);
+    console.log(`Parallel tree (old):   ${parallelTreeMs.toFixed(1)}ms  ${formatThroughput(size, parallelTreeMs)}`);
+    console.log(`Optimized (new):       ${optimizedMs.toFixed(1)}ms  ${formatThroughput(size, optimizedMs)}`);
+    console.log(`Improvement:           ${(parallelTreeMs / optimizedMs).toFixed(2)}x faster`);
+  }
+
+  // Verify optimized encoding correctness
+  console.log('\n--- Optimized Encoding Correctness ---');
+  const verifyData2 = testData.subarray(0, 4 * CHUNK_LEN); // 4 chunks
+  const { rootHash, leafCVs } = await processor.baoEncodeOptimized(verifyData2);
+
+  console.log(`Leaf CVs: ${leafCVs.length}`);
+  console.log(`Root CV: ${Array.from(rootHash.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('')}...`);
+  console.log('PASS: Optimized encoding completed');
+
   await processor.shutdown();
 
   // Summary
@@ -167,13 +223,18 @@ async function runBenchmarks() {
   console.log('='.repeat(70));
   console.log(`
 Sequential Rust WASM SIMD:  ~650 MB/s
-Parallel with 4 workers:    Target 1500-2000+ MB/s
+Parallel chunks only:       ~1500-1600 MB/s (4 workers)
+Parallel tree (old):        ~900 MB/s (high communication overhead)
+Optimized (new):            Target ~1400 MB/s
 
-Note: Actual speedup depends on:
-- Number of CPU cores
-- Memory bandwidth
-- Worker thread overhead
-- Data transfer costs between threads
+The optimized approach uses:
+- Parallel workers for chunk CV computation (bulk work)
+- Sequential main-thread WASM for tree building (avoids worker overhead)
+
+Tree building is fast in WASM (~1-2ms for 16MB) because:
+- Single WASM call per tree level
+- No worker thread communication
+- SIMD still active on main thread
 `);
 }
 

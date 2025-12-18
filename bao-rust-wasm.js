@@ -31,25 +31,24 @@ async function initWasm() {
     const wasmPath = path.join(__dirname, 'rust-bao', 'pkg', 'bao_wasm_bg.wasm');
     const wasmBuffer = fs.readFileSync(wasmPath);
 
-    // Create imports object
-    const imports = {
-      wbg: {
-        __wbindgen_init_externref_table: function() {
-          // Initialize externref table if present
-          if (wasmModule && wasmModule.exports.__wbindgen_externrefs) {
-            const table = wasmModule.exports.__wbindgen_externrefs;
-            const offset = table.grow(4);
-            table.set(0, undefined);
-            table.set(offset + 0, undefined);
-            table.set(offset + 1, null);
-            table.set(offset + 2, true);
-            table.set(offset + 3, false);
-          }
+    // Create imports object - must match wasm-bindgen expectations
+    const importsObj = {};
+    importsObj['__wbindgen_placeholder__'] = {
+      __wbindgen_init_externref_table: function() {
+        // Initialize externref table if present
+        if (wasmModule && wasmModule.exports.__wbindgen_externrefs) {
+          const table = wasmModule.exports.__wbindgen_externrefs;
+          const offset = table.grow(4);
+          table.set(0, undefined);
+          table.set(offset + 0, undefined);
+          table.set(offset + 1, null);
+          table.set(offset + 2, true);
+          table.set(offset + 3, false);
         }
       }
     };
 
-    const result = await WebAssembly.instantiate(wasmBuffer, imports);
+    const result = await WebAssembly.instantiate(wasmBuffer, importsObj);
     wasmModule = result.instance;
 
     // Call wasm start function if present
@@ -79,8 +78,8 @@ async function initWasm() {
  */
 function _refreshViews() {
   const memBuffer = new Uint8Array(wasmMemory.buffer);
-  inputView = new Uint8Array(wasmMemory.buffer, inputPtr, 65536);
-  outputView = new Uint8Array(wasmMemory.buffer, outputPtr, 65536);
+  inputView = new Uint8Array(wasmMemory.buffer, inputPtr, 1048576);
+  outputView = new Uint8Array(wasmMemory.buffer, outputPtr, 1048576);
 }
 
 /**
@@ -169,7 +168,7 @@ function batchChunkCVs(data, startIndex, numChunks) {
   }
 
   _checkMemory();
-  const maxBatch = 64; // Max chunks per batch (64KB input buffer)
+  const maxBatch = 256; // Max chunks per batch
   const results = [];
   let processed = 0;
 
@@ -270,6 +269,91 @@ function batchChunkCVsDirect(numChunks, startIndex) {
   return outputView.subarray(0, numChunks * HASH_SIZE);
 }
 
+// Max leaves that fit in 1MB input buffer
+const MAX_SINGLE_PASS_LEAVES = Math.floor(1048576 / HASH_SIZE); // 32768
+
+/**
+ * Build entire Merkle tree in a single WASM call.
+ * For large trees (>8192 leaves), uses level-by-level approach.
+ * @param {Array<Uint8Array>} leafCVs - Array of 32-byte leaf CVs
+ * @returns {Uint8Array} 32-byte root CV
+ */
+function buildTreeSinglePass(leafCVs) {
+  if (!wasmModule) {
+    throw new Error('WASM not initialized. Call initWasm() first.');
+  }
+
+  const numLeaves = leafCVs.length;
+  if (numLeaves === 0) {
+    throw new Error('No leaf CVs provided');
+  }
+
+  if (numLeaves === 1) {
+    return new Uint8Array(leafCVs[0]);
+  }
+
+  // For large trees, use level-by-level batched approach
+  if (numLeaves > MAX_SINGLE_PASS_LEAVES) {
+    return _buildTreeLevelByLevel(leafCVs);
+  }
+
+  _checkMemory();
+
+  // Write all leaf CVs to input buffer
+  for (let i = 0; i < numLeaves; i++) {
+    inputView.set(leafCVs[i], i * HASH_SIZE);
+  }
+
+  // Call single-pass tree builder
+  // Note: This may grow WASM memory (Vec allocation), so check memory after
+  const bytesWritten = wasmModule.exports.build_tree_single_pass(numLeaves);
+
+  // Refresh views in case WASM memory grew during Vec allocation
+  _checkMemory();
+
+  if (bytesWritten !== HASH_SIZE) {
+    throw new Error('Tree building failed: expected ' + HASH_SIZE + ' bytes, got ' + bytesWritten);
+  }
+
+  // Return copy of root CV from output buffer
+  return new Uint8Array(outputView.subarray(0, HASH_SIZE));
+}
+
+/**
+ * Build tree level-by-level using batchParentCVs.
+ * Used for large trees that don't fit in single-pass buffer.
+ * @private
+ */
+function _buildTreeLevelByLevel(leafCVs) {
+  let currentLevel = leafCVs;
+
+  while (currentLevel.length > 1) {
+    const numPairs = Math.floor(currentLevel.length / 2);
+    const hasOdd = currentLevel.length % 2 === 1;
+    const isLastLevel = numPairs === 1 && !hasOdd;
+    const rootIndex = isLastLevel ? 0 : -1;
+
+    // Build pairs array
+    const pairs = [];
+    for (let i = 0; i < numPairs; i++) {
+      pairs.push([currentLevel[i * 2], currentLevel[i * 2 + 1]]);
+    }
+
+    // Single WASM call for all pairs at this level
+    const parentCVs = batchParentCVs(pairs, rootIndex);
+
+    // Build next level
+    const nextLevel = parentCVs.slice();
+    if (hasOdd) {
+      nextLevel.push(currentLevel[currentLevel.length - 1]);
+    }
+
+    currentLevel = nextLevel;
+  }
+
+  return currentLevel[0];
+}
+
 /**
  * Get SIMD status info from the WASM module.
  * @returns {string} SIMD status message
@@ -307,6 +391,7 @@ module.exports = {
   batchParentCVs,
   chunkCVDirect,
   batchChunkCVsDirect,
+  buildTreeSinglePass,
   CHUNK_LEN,
   HASH_SIZE
 };

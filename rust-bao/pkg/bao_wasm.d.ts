@@ -17,6 +17,14 @@ export function batch_chunk_cvs(num_chunks: number, start_index: bigint): void;
 export function batch_parent_cvs(num_pairs: number, root_index: number): void;
 
 /**
+ * Build entire Merkle tree in a single pass
+ * Reads num_leaves * 32 bytes (leaf CVs) from INPUT_BUFFER
+ * Writes 32-byte root CV to OUTPUT_BUFFER
+ * Returns bytes written (32) or 0 on error
+ */
+export function build_tree_single_pass(num_leaves: number): number;
+
+/**
  * Compute chunk CV - main export
  * Reads chunk data from INPUT_BUFFER, writes CV to OUTPUT_BUFFER
  */
@@ -53,43 +61,3 @@ export function get_simd_info(): string;
  * Writes result to OUTPUT_BUFFER[0..32]
  */
 export function parent_cv(is_root: boolean): void;
-
-export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
-
-export interface InitOutput {
-  readonly memory: WebAssembly.Memory;
-  readonly chunk_cv: (a: number, b: bigint, c: number) => void;
-  readonly get_input_ptr: () => number;
-  readonly get_input_size: () => number;
-  readonly get_output_ptr: () => number;
-  readonly get_simd_info: () => [number, number];
-  readonly parent_cv: (a: number) => void;
-  readonly batch_parent_cvs: (a: number, b: number) => void;
-  readonly get_output_size: () => number;
-  readonly batch_chunk_cvs: (a: number, b: bigint) => void;
-  readonly __wbindgen_externrefs: WebAssembly.Table;
-  readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-  readonly __wbindgen_start: () => void;
-}
-
-export type SyncInitInput = BufferSource | WebAssembly.Module;
-
-/**
-* Instantiates the given `module`, which can either be bytes or
-* a precompiled `WebAssembly.Module`.
-*
-* @param {{ module: SyncInitInput }} module - Passing `SyncInitInput` directly is deprecated.
-*
-* @returns {InitOutput}
-*/
-export function initSync(module: { module: SyncInitInput } | SyncInitInput): InitOutput;
-
-/**
-* If `module_or_path` is {RequestInfo} or {URL}, makes a request and
-* for everything else, calls `WebAssembly.instantiate` directly.
-*
-* @param {{ module_or_path: InitInput | Promise<InitInput> }} module_or_path - Passing `InitInput` directly is deprecated.
-*
-* @returns {Promise<InitOutput>}
-*/
-export default function __wbg_init (module_or_path?: { module_or_path: InitInput | Promise<InitInput> } | InitInput | Promise<InitInput>): Promise<InitOutput>;

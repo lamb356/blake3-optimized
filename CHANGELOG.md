@@ -13,19 +13,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `bao-rust-worker.js` - Worker thread with dedicated WASM instance
   - Automatic work distribution across CPU cores
   - Scales linearly with available cores
+- **Persistent Worker Pool** for batch file processing
+  - `worker-pool.js` - Singleton worker pool with keep-alive
+  - `baoEncodeWithPool()` - Optimized encoding for multiple files
+  - Eliminates ~35ms worker startup overhead per encode
+  - **15.8x faster** for batch operations
+- **Single-pass tree building** in Rust WASM
+  - `build_tree_single_pass()` - Entire Merkle tree in one WASM call
+  - 1MB buffers support up to 32K leaf CVs
+  - Reduces tree overhead from ~5ms to <1ms
+- **DataView optimization** for byte-to-word conversion
+  - `loadBlockFast()` in bao.js uses DataView for aligned 32-bit reads
+  - Handles edge cases (empty blocks, unaligned data)
 
 ### Performance
-- Peak throughput: **1778 MB/s** with 8 workers (was 651 MB/s sequential)
-- 4 workers: **1600 MB/s** (2.55x speedup over sequential)
-- 8 workers: **1778 MB/s** (2.83x speedup over sequential)
-- **17.6x faster** than v1.0.0 baseline (~101 MB/s)
+- **Parallel chunks:** 1,600 MB/s (4 workers), 1,684 MB/s (8 workers)
+- **Full encoding (optimized):** 1,171 MB/s for 16MB data
+- **Worker pool batch:** 1,000 MB/s sustained across multiple files
+- **Sequential Rust WASM:** 651 MB/s (3.47x faster than pure JS)
+- **Pure JS baseline:** 190 MB/s
+
+### Speedups vs v1.0.0 (101 MB/s baseline)
+- Parallel chunks: **16.7x faster**
+- Full optimized encoding: **11.6x faster**
+- Worker pool batch: **9.9x faster**
+- Sequential WASM: **6.4x faster**
 
 ### Usage
 ```javascript
+// Parallel processor (create/shutdown per use)
 const { createParallelProcessor } = require('blake3-bao').baoRustParallel;
-const processor = await createParallelProcessor(4); // 4 workers
-const cvs = await processor.batchChunkCVsParallel(data, 0);
+const processor = await createParallelProcessor(4);
+const { rootHash } = await processor.baoEncodeOptimized(data);
 await processor.shutdown();
+
+// Worker pool (best for batch processing)
+const { baoEncodeWithPool, shutdownWorkerPool } = require('blake3-bao').baoRustParallel;
+for (const file of files) {
+  const { rootHash } = await baoEncodeWithPool(file.data, 4);
+}
+await shutdownWorkerPool();
 ```
 
 ## [1.2.0] - 2024-12-18

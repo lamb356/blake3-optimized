@@ -31,23 +31,22 @@ async function initWasm() {
     const wasmPath = path.join(__dirname, 'rust-bao', 'pkg', 'bao_wasm_bg.wasm');
     const wasmBuffer = fs.readFileSync(wasmPath);
 
-    const imports = {
-      wbg: {
-        __wbindgen_init_externref_table: function() {
-          if (wasmModule && wasmModule.exports.__wbindgen_externrefs) {
-            const table = wasmModule.exports.__wbindgen_externrefs;
-            const offset = table.grow(4);
-            table.set(0, undefined);
-            table.set(offset + 0, undefined);
-            table.set(offset + 1, null);
-            table.set(offset + 2, true);
-            table.set(offset + 3, false);
-          }
+    const importsObj = {};
+    importsObj['__wbindgen_placeholder__'] = {
+      __wbindgen_init_externref_table: function() {
+        if (wasmModule && wasmModule.exports.__wbindgen_externrefs) {
+          const table = wasmModule.exports.__wbindgen_externrefs;
+          const offset = table.grow(4);
+          table.set(0, undefined);
+          table.set(offset + 0, undefined);
+          table.set(offset + 1, null);
+          table.set(offset + 2, true);
+          table.set(offset + 3, false);
         }
       }
     };
 
-    const result = await WebAssembly.instantiate(wasmBuffer, imports);
+    const result = await WebAssembly.instantiate(wasmBuffer, importsObj);
     wasmModule = result.instance;
 
     if (wasmModule.exports.__wbindgen_start) {
@@ -67,8 +66,8 @@ async function initWasm() {
 }
 
 function refreshViews() {
-  inputView = new Uint8Array(wasmMemory.buffer, inputPtr, 65536);
-  outputView = new Uint8Array(wasmMemory.buffer, outputPtr, 65536);
+  inputView = new Uint8Array(wasmMemory.buffer, inputPtr, 1048576);
+  outputView = new Uint8Array(wasmMemory.buffer, outputPtr, 1048576);
 }
 
 function checkMemory() {
@@ -87,7 +86,7 @@ function checkMemory() {
 function batchChunkCVs(data, startIndex, numChunks) {
   checkMemory();
 
-  const maxBatch = 64; // Max chunks per WASM call (64KB buffer)
+  const maxBatch = 256; // Max chunks per WASM call
   const results = new Uint8Array(numChunks * HASH_SIZE);
   let processed = 0;
 
@@ -118,6 +117,45 @@ function chunkCV(chunk, chunkIndex, isRoot) {
   inputView.set(chunk, 0);
   wasmModule.exports.chunk_cv(chunk.length, BigInt(chunkIndex), isRoot);
   return new Uint8Array(outputView.subarray(0, HASH_SIZE));
+}
+
+/**
+ * Compute batch of parent CVs.
+ * @param {Uint8Array} cvPairs - CV pairs (numPairs * 64 bytes)
+ * @param {number} numPairs - Number of CV pairs
+ * @param {number} rootIndex - Index of root pair (-1 for none)
+ * @returns {Uint8Array} Array of parent CVs (numPairs * 32 bytes)
+ */
+function batchParentCVs(cvPairs, numPairs, rootIndex) {
+  checkMemory();
+
+  const maxPairs = 4096; // Max pairs per WASM call (256KB / 64 bytes)
+  const results = new Uint8Array(numPairs * HASH_SIZE);
+  let processed = 0;
+
+  while (processed < numPairs) {
+    const batchSize = Math.min(numPairs - processed, maxPairs);
+    const dataOffset = processed * 64;
+
+    // Copy pairs to input buffer
+    inputView.set(cvPairs.subarray(dataOffset, dataOffset + batchSize * 64), 0);
+
+    // Determine root index for this batch
+    let batchRootIndex = -1;
+    if (rootIndex >= processed && rootIndex < processed + batchSize) {
+      batchRootIndex = rootIndex - processed;
+    }
+
+    // Process batch
+    wasmModule.exports.batch_parent_cvs(batchSize, batchRootIndex);
+
+    // Copy results
+    results.set(outputView.subarray(0, batchSize * HASH_SIZE), processed * HASH_SIZE);
+
+    processed += batchSize;
+  }
+
+  return results;
 }
 
 // Initialize WASM on worker start
@@ -152,6 +190,17 @@ parentPort.on('message', (msg) => {
           taskId,
           cv: cv.buffer
         }, [cv.buffer]);
+        break;
+      }
+
+      case 'batchParentCVs': {
+        const { taskId, cvPairs, numPairs, rootIndex } = msg;
+        const cvs = batchParentCVs(new Uint8Array(cvPairs), numPairs, rootIndex);
+        parentPort.postMessage({
+          type: 'result',
+          taskId,
+          cvs: cvs.buffer
+        }, [cvs.buffer]);
         break;
       }
 

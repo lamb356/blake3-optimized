@@ -8,9 +8,10 @@ use wasm_bindgen::prelude::*;
 const CHUNK_LEN: usize = 1024;
 const OUT_LEN: usize = 32;
 
-// Pre-allocated buffers for zero-copy operations
-const INPUT_SIZE: usize = 65536;
-const OUTPUT_SIZE: usize = 65536;
+// Pre-allocated buffers for zero-copy operations (1MB each)
+// Supports up to 32K leaf CVs for single-pass tree building
+const INPUT_SIZE: usize = 1048576;  // 1MB
+const OUTPUT_SIZE: usize = 1048576; // 1MB
 
 static mut INPUT_BUFFER: [u8; INPUT_SIZE] = [0u8; INPUT_SIZE];
 static mut OUTPUT_BUFFER: [u8; OUTPUT_SIZE] = [0u8; OUTPUT_SIZE];
@@ -131,6 +132,58 @@ pub fn batch_parent_cvs(num_pairs: usize, root_index: i32) {
             let out_offset = i * OUT_LEN;
             OUTPUT_BUFFER[out_offset..out_offset + OUT_LEN].copy_from_slice(&cv);
         }
+    }
+}
+
+/// Build entire Merkle tree in a single pass
+/// Reads num_leaves * 32 bytes (leaf CVs) from INPUT_BUFFER
+/// Writes 32-byte root CV to OUTPUT_BUFFER
+/// Returns bytes written (32) or 0 on error
+#[wasm_bindgen]
+pub fn build_tree_single_pass(num_leaves: usize) -> usize {
+    unsafe {
+        if num_leaves == 0 {
+            return 0;
+        }
+        if num_leaves == 1 {
+            // Single leaf is root - copy from input to output
+            OUTPUT_BUFFER[..32].copy_from_slice(&INPUT_BUFFER[..32]);
+            return 32;
+        }
+
+        // Read all leaf CVs from INPUT_BUFFER
+        let mut current_level: Vec<[u8; 32]> = Vec::with_capacity(num_leaves);
+        for i in 0..num_leaves {
+            let offset = i * 32;
+            let mut cv = [0u8; 32];
+            cv.copy_from_slice(&INPUT_BUFFER[offset..offset + 32]);
+            current_level.push(cv);
+        }
+
+        // Build tree level by level
+        while current_level.len() > 1 {
+            let num_pairs = current_level.len() / 2;
+            let has_odd = current_level.len() % 2 == 1;
+            let is_root_level = current_level.len() == 2 && !has_odd;
+
+            let mut next_level = Vec::with_capacity(num_pairs + if has_odd { 1 } else { 0 });
+
+            for i in 0..num_pairs {
+                let is_root = is_root_level && i == 0;
+                let parent = compute_parent_cv(&current_level[i * 2], &current_level[i * 2 + 1], is_root);
+                next_level.push(parent);
+            }
+
+            if has_odd {
+                next_level.push(current_level[current_level.len() - 1]);
+            }
+
+            current_level = next_level;
+        }
+
+        // Write root to output buffer
+        OUTPUT_BUFFER[..32].copy_from_slice(&current_level[0]);
+        32 // Return bytes written
     }
 }
 
