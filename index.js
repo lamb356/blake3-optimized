@@ -61,3 +61,11 @@ try {
   exports.baoWasm = null;
   exports.baoWasmZerocopy = null;
 }
+
+// Rust WASM SIMD-accelerated module (optional)
+// Uses official blake3 crate for 3x faster crypto operations
+try {
+  exports.baoRustWasm = require('./bao-rust-wasm.js');
+} catch (e) {
+  exports.baoRustWasm = null;
+}

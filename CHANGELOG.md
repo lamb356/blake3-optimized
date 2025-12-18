@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2024-12-18
+
+### Added
+- **Rust WASM SIMD acceleration** using the official blake3 crate
+  - `bao-rust-wasm.js` module with zero-copy buffer operations
+  - SIMD128 instructions for parallel processing
+  - Batch `chunkCV` and `parentCV` operations
+  - Direct memory access API for maximum performance
+
+### Performance
+- chunkCV primitive: **651 MB/s** (was ~203 MB/s, **3.3x faster** than v1.1.0)
+- Batch chunk processing: **665 MB/s** throughput
+- **6.4x faster** than v1.0.0 baseline (~101 MB/s)
+- parentCV: 1.67x faster than JS
+
+### Technical Details
+- Uses `blake3::guts::ChunkState` for chunk CV computation
+- Uses `blake3::guts::parent_cv` for parent CV computation
+- 64KB pre-allocated input/output buffers for zero-copy operations
+- Built with wasm32-unknown-unknown target + wasm-bindgen
+
 ## [1.1.0] - 2024-12-17
 
 ### Added
