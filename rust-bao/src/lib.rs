@@ -39,6 +39,15 @@ pub fn get_output_size() -> usize {
     OUTPUT_SIZE
 }
 
+/// Get SIMD status info
+#[wasm_bindgen]
+pub fn get_simd_info() -> String {
+    #[cfg(target_feature = "simd128")]
+    { "SIMD128 enabled".to_string() }
+    #[cfg(not(target_feature = "simd128"))]
+    { "SIMD NOT enabled".to_string() }
+}
+
 /// Compute chunk chaining value using blake3 crate's guts module
 fn compute_chunk_cv(data: &[u8], chunk_index: u64, is_root: bool) -> [u8; 32] {
     // Use the guts module with deprecated API (still works)

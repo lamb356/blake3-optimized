@@ -43,6 +43,11 @@ export function get_output_ptr(): number;
 export function get_output_size(): number;
 
 /**
+ * Get SIMD status info
+ */
+export function get_simd_info(): string;
+
+/**
  * Compute parent CV from two child CVs
  * Reads left CV from INPUT_BUFFER[0..32], right from INPUT_BUFFER[32..64]
  * Writes result to OUTPUT_BUFFER[0..32]
@@ -57,11 +62,13 @@ export interface InitOutput {
   readonly get_input_ptr: () => number;
   readonly get_input_size: () => number;
   readonly get_output_ptr: () => number;
+  readonly get_simd_info: () => [number, number];
   readonly parent_cv: (a: number) => void;
   readonly batch_parent_cvs: (a: number, b: number) => void;
   readonly get_output_size: () => number;
   readonly batch_chunk_cvs: (a: number, b: bigint) => void;
   readonly __wbindgen_externrefs: WebAssembly.Table;
+  readonly __wbindgen_free: (a: number, b: number, c: number) => void;
   readonly __wbindgen_start: () => void;
 }
 

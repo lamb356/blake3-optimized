@@ -1,5 +1,32 @@
 let wasm;
 
+function getStringFromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return decodeText(ptr, len);
+}
+
+let cachedUint8ArrayMemory0 = null;
+function getUint8ArrayMemory0() {
+    if (cachedUint8ArrayMemory0 === null || cachedUint8ArrayMemory0.byteLength === 0) {
+        cachedUint8ArrayMemory0 = new Uint8Array(wasm.memory.buffer);
+    }
+    return cachedUint8ArrayMemory0;
+}
+
+let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
+cachedTextDecoder.decode();
+const MAX_SAFARI_DECODE_BYTES = 2146435072;
+let numBytesDecoded = 0;
+function decodeText(ptr, len) {
+    numBytesDecoded += len;
+    if (numBytesDecoded >= MAX_SAFARI_DECODE_BYTES) {
+        cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
+        cachedTextDecoder.decode();
+        numBytesDecoded = len;
+    }
+    return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
+}
+
 /**
  * Batch compute chunk CVs
  * Reads num_chunks * 1024 bytes from INPUT_BUFFER
@@ -71,6 +98,23 @@ export function get_output_size() {
 }
 
 /**
+ * Get SIMD status info
+ * @returns {string}
+ */
+export function get_simd_info() {
+    let deferred1_0;
+    let deferred1_1;
+    try {
+        const ret = wasm.get_simd_info();
+        deferred1_0 = ret[0];
+        deferred1_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+    }
+}
+
+/**
  * Compute parent CV from two child CVs
  * Reads left CV from INPUT_BUFFER[0..32], right from INPUT_BUFFER[32..64]
  * Writes result to OUTPUT_BUFFER[0..32]
@@ -131,6 +175,7 @@ function __wbg_get_imports() {
 function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     __wbg_init.__wbindgen_wasm_module = module;
+    cachedUint8ArrayMemory0 = null;
 
 
     wasm.__wbindgen_start();

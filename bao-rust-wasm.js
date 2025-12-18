@@ -270,9 +270,35 @@ function batchChunkCVsDirect(numChunks, startIndex) {
   return outputView.subarray(0, numChunks * HASH_SIZE);
 }
 
+/**
+ * Get SIMD status info from the WASM module.
+ * @returns {string} SIMD status message
+ */
+function getSimdInfo() {
+  if (!wasmModule) {
+    return 'WASM not initialized';
+  }
+  if (!wasmModule.exports.get_simd_info) {
+    return 'get_simd_info not available';
+  }
+  // wasm-bindgen returns [ptr, len] tuple for strings
+  const ret = wasmModule.exports.get_simd_info();
+  const ptr = ret[0] >>> 0;
+  const len = ret[1] >>> 0;
+  // Read the string from WASM memory
+  const memory = new Uint8Array(wasmMemory.buffer);
+  const bytes = memory.slice(ptr, ptr + len);
+  const decoder = new TextDecoder('utf-8');
+  const result = decoder.decode(bytes);
+  // Free the allocation
+  wasmModule.exports.__wbindgen_free(ptr, len, 1);
+  return result;
+}
+
 module.exports = {
   initWasm,
   isWasmEnabled,
+  getSimdInfo,
   getInputBuffer,
   getOutputBuffer,
   chunkCV,
