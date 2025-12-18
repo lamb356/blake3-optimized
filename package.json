@@ -1,6 +1,6 @@
 {
   "name": "blake3-bao",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Pure JavaScript BLAKE3 hash and Bao verified streaming implementation with Iroh compatibility",
   "main": "index.js",
   "module": "index.mjs",
@@ -33,6 +33,8 @@
     "bao-wasm.js",
     "bao-wasm-zerocopy.js",
     "bao-rust-wasm.js",
+    "bao-rust-worker.js",
+    "bao-rust-parallel.js",
     "rust-bao/pkg/",
     "build/release.wasm",
     "dist/",

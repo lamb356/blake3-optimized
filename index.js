@@ -69,3 +69,11 @@ try {
 } catch (e) {
   exports.baoRustWasm = null;
 }
+
+// Parallel Rust WASM with worker threads (optional)
+// Scales across CPU cores for 1778+ MB/s throughput
+try {
+  exports.baoRustParallel = require('./bao-rust-parallel.js');
+} catch (e) {
+  exports.baoRustParallel = null;
+}
