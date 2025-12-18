@@ -128,23 +128,20 @@ class PersistentWorkerPool {
       throw new Error('Worker pool not initialized. Call init() first.');
     }
 
-    // Find available worker (round-robin with availability check)
+    // Atomically claim an available worker
     let workerId = -1;
-    for (let i = 0; i < this.numWorkers; i++) {
-      if (this.workerReady[i]) {
-        workerId = i;
-        break;
-      }
-    }
-
-    // If no worker available, wait for one
-    if (workerId === -1) {
-      await this._waitForWorker();
+    while (workerId === -1) {
       for (let i = 0; i < this.numWorkers; i++) {
         if (this.workerReady[i]) {
+          this.workerReady[i] = false; // Atomically claim this worker
           workerId = i;
           break;
         }
+      }
+
+      // If no worker available, wait for one and retry
+      if (workerId === -1) {
+        await this._waitForWorker();
       }
     }
 
@@ -179,12 +176,14 @@ class PersistentWorkerPool {
       const dataStart = workerStartChunk * CHUNK_LEN;
       const dataEnd = workerEndChunk * CHUNK_LEN;
       const workerData = data.slice(dataStart, dataEnd);
+      // Capture buffer reference immediately - slice() creates new ArrayBuffer
+      const workerBuffer = workerData.buffer;
 
       tasks.push({
         workerId: i,
         startChunk: workerStartChunk,
         numChunks: workerNumChunks,
-        data: workerData
+        buffer: workerBuffer  // Store the sliced buffer directly
       });
     }
 
@@ -192,10 +191,10 @@ class PersistentWorkerPool {
     const taskPromises = tasks.map(task => {
       return this._sendTask(task.workerId, {
         type: 'batchChunkCVs',
-        data: task.data.buffer,
+        data: task.buffer,
         startIndex: startIndex + task.startChunk,
         numChunks: task.numChunks,
-        transfer: [task.data.buffer]
+        transfer: [task.buffer]
       }).then(result => ({
         startChunk: task.startChunk,
         cvs: new Uint8Array(result.cvs)
@@ -228,7 +227,6 @@ class PersistentWorkerPool {
       message.taskId = taskId;
 
       this.pendingTasks.set(taskId, { resolve, reject, workerId });
-      this.workerReady[workerId] = false;
       this.workers[workerId].postMessage(message, message.transfer || []);
     });
   }
@@ -267,15 +265,25 @@ class PersistentWorkerPool {
     const shutdownPromises = this.workers.map((worker, i) => {
       if (worker) {
         return new Promise(resolve => {
+          let exited = false;
           worker.postMessage({ type: 'shutdown' });
-          worker.on('exit', resolve);
-          setTimeout(resolve, 1000);
+          worker.on('exit', () => {
+            exited = true;
+            resolve();
+          });
+          setTimeout(() => {
+            if (!exited) {
+              worker.terminate();
+            }
+            resolve();
+          }, 1000);
         });
       }
       return Promise.resolve();
     });
 
     await Promise.all(shutdownPromises);
+    this.pendingTasks.clear();
     this.workers = [];
     this.workerReady = [];
     this.initialized = false;

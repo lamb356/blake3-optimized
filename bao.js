@@ -55,6 +55,16 @@ function loadBlockFast(chunkBytes, blockStart, blockLen, blockWords) {
   // Handle empty block
   if (blockLen === 0) return;
 
+  // Check for detached buffer
+  if (chunkBytes.buffer && chunkBytes.buffer.byteLength === 0) {
+    throw new Error('Cannot load from detached ArrayBuffer');
+  }
+
+  // Bounds check
+  if (blockStart + blockLen > chunkBytes.length) {
+    throw new Error('Block extends beyond buffer bounds');
+  }
+
   // Use DataView for efficient 32-bit reads (little-endian)
   const alignedLen = blockLen & ~3; // Round down to 4-byte boundary
 

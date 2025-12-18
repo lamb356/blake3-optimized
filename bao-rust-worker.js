@@ -169,11 +169,14 @@ initWasm().then(ok => {
 
 // Handle messages from main thread
 parentPort.on('message', (msg) => {
+  const taskId = msg.taskId !== undefined ? msg.taskId : -1;
   try {
     switch (msg.type) {
       case 'batchChunkCVs': {
-        const { taskId, data, startIndex, numChunks } = msg;
-        const cvs = batchChunkCVs(new Uint8Array(data), startIndex, numChunks);
+        if (!msg.data || msg.startIndex === undefined || msg.numChunks === undefined) {
+          throw new Error('batchChunkCVs requires data, startIndex, and numChunks');
+        }
+        const cvs = batchChunkCVs(new Uint8Array(msg.data), msg.startIndex, msg.numChunks);
         parentPort.postMessage({
           type: 'result',
           taskId,
@@ -183,8 +186,10 @@ parentPort.on('message', (msg) => {
       }
 
       case 'chunkCV': {
-        const { taskId, chunk, chunkIndex, isRoot } = msg;
-        const cv = chunkCV(new Uint8Array(chunk), chunkIndex, isRoot);
+        if (!msg.chunk || msg.chunkIndex === undefined || msg.isRoot === undefined) {
+          throw new Error('chunkCV requires chunk, chunkIndex, and isRoot');
+        }
+        const cv = chunkCV(new Uint8Array(msg.chunk), msg.chunkIndex, msg.isRoot);
         parentPort.postMessage({
           type: 'result',
           taskId,
@@ -194,8 +199,10 @@ parentPort.on('message', (msg) => {
       }
 
       case 'batchParentCVs': {
-        const { taskId, cvPairs, numPairs, rootIndex } = msg;
-        const cvs = batchParentCVs(new Uint8Array(cvPairs), numPairs, rootIndex);
+        if (!msg.cvPairs || msg.numPairs === undefined || msg.rootIndex === undefined) {
+          throw new Error('batchParentCVs requires cvPairs, numPairs, and rootIndex');
+        }
+        const cvs = batchParentCVs(new Uint8Array(msg.cvPairs), msg.numPairs, msg.rootIndex);
         parentPort.postMessage({
           type: 'result',
           taskId,
@@ -209,9 +216,9 @@ parentPort.on('message', (msg) => {
         break;
 
       default:
-        parentPort.postMessage({ type: 'error', error: `Unknown message type: ${msg.type}` });
+        parentPort.postMessage({ type: 'error', error: `Unknown message type: ${msg.type}`, taskId });
     }
   } catch (err) {
-    parentPort.postMessage({ type: 'error', error: err.message, taskId: msg.taskId });
+    parentPort.postMessage({ type: 'error', error: err.message, stack: err.stack, taskId });
   }
 });

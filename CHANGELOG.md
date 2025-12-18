@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2024-12-18
+
+### Fixed
+- Race condition in worker pool executeTask() - atomic worker claiming
+- Buffer transfer bug in batchChunkCVsParallel() - correct buffer reference
+- Bounds check in build_tree_single_pass() - prevents buffer overflow
+- Worker shutdown now force terminates after timeout
+- Error propagation in workers - validation and stack traces
+- DataView edge cases - detached buffer and bounds checks
+
 ## [1.3.1] - 2024-12-18
 
 ### Improved

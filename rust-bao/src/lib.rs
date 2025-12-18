@@ -142,7 +142,7 @@ pub fn batch_parent_cvs(num_pairs: usize, root_index: i32) {
 #[wasm_bindgen]
 pub fn build_tree_single_pass(num_leaves: usize) -> usize {
     unsafe {
-        if num_leaves == 0 {
+        if num_leaves == 0 || num_leaves > INPUT_SIZE / 32 {
             return 0;
         }
         if num_leaves == 1 {
