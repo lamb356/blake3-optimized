@@ -240,7 +240,7 @@ class PersistentWorkerPool {
       for (let i = 0; i < this.numWorkers; i++) {
         if (this.workerReady[i]) return;
       }
-      await new Promise(resolve => setTimeout(resolve, 0));
+      await new Promise(resolve => setTimeout(resolve, 10));
     }
   }
 
@@ -267,7 +267,7 @@ class PersistentWorkerPool {
         return new Promise(resolve => {
           let exited = false;
           worker.postMessage({ type: 'shutdown' });
-          worker.on('exit', () => {
+          worker.once('exit', () => {
             exited = true;
             resolve();
           });
